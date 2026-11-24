@@ -9,7 +9,7 @@ live Herdr home (`~/.config/herdr-app`, or `HERDR_APP_HOME`).
 | Path | What it is |
 |:--|:--|
 | `home/layouts/main-fp.json` | The layout: Herdr's `main` with my Files and Git panels |
-| `home/mods/tabs-fp/` | Tab bar; the Changes button is called Git; badges show uncommitted files and unpushed commits (↑N) |
+| `home/mods/tabs-fp/` | Tab bar; the Changes button is called Git and shows how many files are uncommitted |
 | `home/mods/files-fp/` | Files panel: edit local text files (ctrl-s saves; Markdown has Edit/Preview), Markdown, Mermaid and image preview, Show in Explorer |
 | `home/mods/changes-fp/` | Git panel with a Commits tab |
 | `home/mods/file-preview/` | [bborrero14/herdr-file-preview](https://github.com/bborrero14/herdr-file-preview) (MIT), fitted to Windows. The others use its Mermaid renderer (`.pele/`) and its enlarged view |

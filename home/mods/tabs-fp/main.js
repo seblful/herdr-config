@@ -44,40 +44,25 @@ export default class Tabs extends View {
     this.pressed = null;
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
     this.widths = JSON.parse(localStorage.getItem("widths") ?? "{}");
-    this.dirty = null; this.ahead = 0; this.dirtyKey = null;   // fp: uncommitted files (null: not a repo) and unpushed commits in the focused folder's repo
+    this.dirty = null; this.dirtyKey = null;   // fp: uncommitted files in the focused folder's repo (null: not a repo)
     cx.timer.every(4000, cx => this.countChanges(cx));
   }
 
-  /** fp: count uncommitted files (staged, unstaged, untracked) and commits not pushed to the upstream branch,
-   *  for the Git button; one count at a time. */
+  /** fp: count uncommitted files (staged, unstaged, untracked) for the Git button; at most one git at a time. */
   countChanges(cx) {
     const where = location(), k = JSON.stringify(where);
     if (this.counting || !where.cwd) { if (!where.cwd && this.dirty !== null) { this.dirty = null; cx.notify(); } return; }
     this.counting = true;
     cx.spawn(async cx => {
-      let n = null, ahead = 0;
-      const opts = { cwd: where.cwd, on: where.on, timeout: 15000 };
+      let n = null;
       try {
-        const r = await exec("git", [...READ, "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], opts);
-        if (r.code === 0) {
-          n = r.stdout.split("\0").filter(Boolean).length;
-          // No upstream (a local-only branch): nothing to push, so no count.
-          const a = await exec("git", [...READ, "rev-list", "--count", "@{upstream}..HEAD"], opts).catch(() => null);
-          if (a?.code === 0) ahead = Number(a.stdout.trim()) || 0;
-        }
+        const r = await exec("git", [...READ, "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], { cwd: where.cwd, on: where.on, timeout: 15000 });
+        if (r.code === 0) n = r.stdout.split("\0").filter(Boolean).length;
       } catch {}
       this.counting = false;
       if (k !== JSON.stringify(location())) return this.countChanges(cx);   // the focus moved meanwhile
-      if (n !== this.dirty || ahead !== this.ahead || k !== this.dirtyKey) { this.dirty = n; this.ahead = ahead; this.dirtyKey = k; cx.notify(); }
+      if (n !== this.dirty || k !== this.dirtyKey) { this.dirty = n; this.dirtyKey = k; cx.notify(); }
     });
-  }
-
-  /** fp: the Git button's hover: what its badges count. */
-  gitTip() {
-    const parts = [];
-    if (this.dirty) parts.push(`${this.dirty} uncommitted ${this.dirty === 1 ? "file" : "files"}`);
-    if (this.ahead) parts.push(`${this.ahead} ${this.ahead === 1 ? "commit" : "commits"} not pushed`);
-    return parts.length ? parts.join(" · ") : null;
   }
 
   // The side panel's width is remembered per tab (the layout keeps one for the whole window):
@@ -178,8 +163,7 @@ export default class Tabs extends View {
     const enabled = shared("workspace.panels") ?? ["files", "changes"];
     this.syncPanel(space, panel, body, enabled);
     this.syncWidth(shown.find(c => c.active), panel);
-    const pill = (text, bg) => div().h(16).min_w(16).px(4).flex().flex_none().items_center().justify_center().rounded(8).bg(bg).text_color(t.background).text_size(10).font_semibold().child(text);
-    const panelButton = (id, label, icon, tip, badges = []) => {
+    const panelButton = (id, label, icon, tip, badge) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
         .text_size(12).bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted).when(Boolean(tip), el => el.tooltip(tip))
@@ -191,7 +175,7 @@ export default class Tabs extends View {
             if (id === PREVIEW) run(`${PREVIEW}.focus-side`);   // file-preview takes the keyboard
           }
         }).child(svg(icon).size(14)).child(label)
-        .children(badges);
+        .when(Boolean(badge), el => el.child(div().h(16).min_w(16).px(4).flex().items_center().justify_center().rounded(8).bg(t.blocked).text_color(t.background).text_size(10).font_semibold().child(badge)));
     };
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
@@ -199,9 +183,7 @@ export default class Tabs extends View {
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().children(shown.map(item)))
       .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
       .when(enabled.includes("files"), el => el.child(panelButton("files", "Files", "mods/files/file.svg")))
-      .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Git", "mods/changes/changes.svg", this.gitTip(), [
-        ...(this.dirty ? [pill(this.dirty > 99 ? "99+" : String(this.dirty), t.blocked)] : []),
-        ...(this.ahead ? [pill(`↑${this.ahead > 99 ? "99+" : this.ahead}`, t.accent)] : [])])))
+      .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Git", "mods/changes/changes.svg", this.dirty ? `${this.dirty} uncommitted ${this.dirty === 1 ? "change" : "changes"}` : null, this.dirty ? (this.dirty > 99 ? "99+" : String(this.dirty)) : null)))
       .when(Boolean(find(root, PREVIEW)), el => el.child(panelButton(PREVIEW, "Preview", "mods/file-preview/icons/file-md.svg", previewTip(w?.platform === "macos"))))
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs-fp/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs-fp/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
