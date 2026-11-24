@@ -1,7 +1,7 @@
-// A lazy file browser for the focused pane's folder, with bounded read-only previews.
+// A lazy file browser for the focused pane's folder, with bounded previews; fp: local text files are editable.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, openOverlay, nextCommand } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, openOverlay, nextCommand } from "herdr";
 // fp additions (copied from mods/file-preview; they share its .pele renderer and .cache)
 import { segment } from "./markdown.js";
 import { isMarkdown } from "./lang.js";
@@ -17,6 +17,8 @@ function location() {
 const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 const PER_FOLDER = 500, TOTAL = 5000;
+const EDIT_MAX = 400000;   // fp: longer files are shown cut short, so they stay read-only
+const lf = (s) => s?.replace(/\r\n/g, "\n");   // fp: the editor may not keep CRLF; compare without it
 
 async function directory(path, on) {
   const windowsDirectory = async () => {
@@ -46,12 +48,13 @@ async function directory(path, on) {
 export default class Files extends View {
   init(_props, cx) {
     this.saved = new Map();
+    this.drafts = new Map(); this.edit = null;   // fp: unsaved text by absolute path; the open file's edit state
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
     this.mermaid = new Mermaid(); this.mermaid.prune();   // fp
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
     // fp: "files-fp.open:<path from the root>" (keys.json or herdr-app do), for keys and tests.
-    cx.spawn(async cx => { for (;;) { const c = await nextCommand(); if (c?.startsWith("open:")) { this.show(c.slice(5), cx); cx.notify(); } else if (c?.startsWith("reveal:")) this.reveal(c.slice(7), c.endsWith("/")); } });
+    cx.spawn(async cx => { for (;;) { const c = await nextCommand(); if (c?.startsWith("open:")) { this.show(c.slice(5), cx); cx.notify(); } else if (c?.startsWith("reveal:")) this.reveal(c.slice(7), c.endsWith("/")); else if (c === "save") this.save(cx); } });
   }
 
   watch(root, cx) {
@@ -109,6 +112,7 @@ export default class Files extends View {
         }
         if (!this.current(context)) return;
         this.marks = marks; this.error = null; this.watch(cwd, cx);
+        await this.recheck(cx);   // fp
       } catch (e) { if (this.current(context)) this.error = String(e); }
       finally { if (this.context === context) this.loading = false; cx.notify(); }
     });
@@ -136,7 +140,8 @@ export default class Files extends View {
   }
 
   show(path, cx) {
-    this.code?.release(); this.code = null; this.file = path; this.fileError = null; this.doc = null;
+    this.stash();   // fp: unsaved edits wait in drafts
+    this.code?.release(); this.code = null; this.file = path; this.fileError = null; this.doc = null; this.edit = null;
     if (!path || !cx) return;
     const context = this.context, root = this.root, on = this.on;
     cx.spawn(async cx => {
@@ -151,11 +156,14 @@ export default class Files extends View {
         if (this.file !== path || !this.current(context)) return;
         if (text === null) { this.fileError = "This file is no longer available"; return; }
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
-        if (isMarkdown(path)) { this.doc = this.markdown(text, cx); return; }   // fp
-        const t = theme(), ext = path.includes(".") ? path.split(".").pop() : "txt";
-        this.code = EditorState.new({ language: LANG[ext] ?? ext, readonly: true,
-          value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
-          syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
+        // fp: local files that fit are editable; a draft left unsaved comes back (its base is what it was edited from).
+        const abs = `${root}/${path}`, draft = this.drafts.get(abs), md = isMarkdown(path);
+        const ed = this.edit = { abs, base: draft?.base ?? text, eol: text.includes("\r\n") ? "\r\n" : "\n", editable: !on && text.length <= EDIT_MAX,
+          readonly: on ? "Files on other machines are read-only" : text.length > EDIT_MAX ? "Too long to edit here" : null,
+          dirty: Boolean(draft), md, mode: md && !draft ? "preview" : "edit", source: draft?.text ?? text, note: null, conflict: false, saving: false };
+        if (draft && !ed.editable) { this.drafts.delete(abs); ed.dirty = false; ed.source = text; ed.base = text; }
+        if (md) { this.doc = this.markdown(ed.source, cx); if (ed.mode === "edit") this.code = this.editor(ed, ed.source); return; }
+        this.code = this.editor(ed, text.length > EDIT_MAX ? text.slice(0, EDIT_MAX) + "\n… (file truncated)" : ed.source);
       } catch { if (this.file === path && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
       finally { cx.notify(); }
     });
@@ -168,10 +176,12 @@ export default class Files extends View {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
         .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
+        .when(!entry.dir && this.drafts.has(`${this.root}/${path}`), el => el.tooltip("Unsaved changes"))
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.reveal(path, entry.dir); })   // fp: in the system file manager
         .child(entry.dir ? svg(`mods/files-fp/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(svg(`mods/files-fp/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
         .child(div().flex_1().min_w(0).truncate().child(entry.name))
+        .when(!entry.dir && this.drafts.has(`${this.root}/${path}`), el => el.child(div().text_size(11).text_color(t.blocked).child("●")))   // fp: unsaved
         .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark))));
       if (entry.dir && open) this.rows(path, depth + 1, out, t);
     }
@@ -254,7 +264,7 @@ export default class Files extends View {
             .on_click(() => this.expand({ key: doc.text, path: doc.path, w: doc.w, h: doc.h, photo: true }, this.file)).child(image(doc.path).w(w).h(h)))
           .child(div().text_size(11.5).text_color(t.dim).child(`${doc.ow} × ${doc.oh} px${mb} · click to expand`)));
     }
-    if (doc?.kind === "markdown") {
+    if (doc?.kind === "markdown" && this.edit?.mode !== "edit") {
       return v_flex().id(`files-md:${this.file}`).flex_1().min_h(0).overflow_y_scrollbar().px(16).py(14)
         .child(v_flex().w_full().gap(12).text_size(14).on_size_change((s, cx) => this.sized(s, cx))
           .children(doc.blocks.map((b, i) => b.kind === "md"
@@ -275,6 +285,118 @@ export default class Files extends View {
     else exec("xdg-open", [dir ? abs : abs.replace(/\/[^/]*$/, "")]).catch(() => {});
   }
 
+  // ——— fp: editing. Local text files edit in place; ctrl-s or Save writes them only if the file on
+  // disk is still what they were opened from, else the person picks Overwrite or Reload.
+
+  /** A code editor for the open file; typing marks it unsaved. */
+  editor(ed, value) {
+    const t = theme(), ext = this.file.includes(".") ? this.file.split(".").pop() : "txt";
+    const state = EditorState.new({ language: LANG[ext] ?? ext, readonly: !ed.editable, value,
+      syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
+    if (ed.editable) state.on("change", (_e, cx) => {
+      const dirty = lf(state.value()) !== lf(ed.base);
+      if (dirty === ed.dirty && !ed.note) return;
+      ed.dirty = dirty; ed.note = null; cx.notify();
+    });
+    return state;
+  }
+
+  /** The open file's text as edited (the editor's, else what the preview shows). */
+  text() {
+    return this.code && this.edit?.editable ? this.code.value() : this.edit?.source;
+  }
+
+  /** Keep unsaved edits of the open file (or forget its draft once it's clean). */
+  stash() {
+    const ed = this.edit;
+    if (!ed?.editable) return;
+    if (ed.dirty) this.drafts.set(ed.abs, { text: this.text(), base: ed.base });
+    else this.drafts.delete(ed.abs);
+  }
+
+  /** Write the edits; force: replace whatever is on disk now (after a conflict). */
+  save(cx, force = false) {
+    const ed = this.edit;
+    if (!ed?.editable || ed.saving || (!ed.dirty && !force)) return;
+    const text = this.text().replace(/\r?\n/g, ed.eol);
+    ed.saving = true; ed.note = null;
+    cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const expected = force ? await readTextFile(ed.abs) : ed.base;
+        await writeTextFile(ed.abs, text, expected);
+        ed.base = text; ed.source = text; ed.conflict = false; ed.note = "Saved";
+        ed.dirty = lf(this.edit === ed ? this.text() : text) !== lf(text);   // typing during the write stays unsaved
+        if (!ed.dirty) this.drafts.delete(ed.abs);
+      } catch (e) {
+        const now = await readTextFile(ed.abs).catch(() => undefined);
+        if (now !== ed.base) ed.conflict = true;
+        else ed.note = `Couldn't save: ${String(e?.message ?? e).slice(0, 120)}`;
+      } finally { ed.saving = false; cx.notify(); }
+    });
+  }
+
+  /** Drop the edits and show the file as it is on disk. */
+  revert(cx) {
+    const ed = this.edit;
+    if (!ed) return;
+    ed.dirty = false; this.drafts.delete(ed.abs);
+    this.show(this.file, cx); cx.notify();
+  }
+
+  /** Markdown: "edit" shows the source in the editor, "preview" renders what's typed so far. */
+  setMode(mode, cx) {
+    const ed = this.edit;
+    if (!ed?.md || ed.mode === mode) return;
+    if (mode === "preview" && this.code) {
+      const text = this.code.value();
+      if (text !== ed.source) { ed.source = text; this.doc = this.markdown(text, cx); }
+    }
+    ed.mode = mode;
+    if (mode === "edit" && !this.code) this.code = this.editor(ed, ed.source);
+    if (mode === "edit") this.code.focus();
+    cx.notify();
+  }
+
+  /** After the folder changed: a clean open file follows what's on disk (an agent's edit, git checkout). */
+  async recheck(cx) {
+    const ed = this.edit, path = this.file;
+    if (!ed?.editable || ed.dirty || ed.saving) return;
+    const text = await readTextFile(ed.abs).catch(() => undefined);
+    if (text == null || text === ed.base || this.edit !== ed || ed.dirty || text.length > EDIT_MAX) return;
+    ed.base = text; ed.source = text; ed.conflict = false; ed.note = null;
+    if (ed.md) this.doc = this.markdown(text, cx);
+    if (this.code) this.code.set_value(text);
+    ed.dirty = false;
+    if (this.file === path) cx.notify();
+  }
+
+  /** The header's edit controls: unsaved dot, Edit/Preview for Markdown, Revert and Save, read-only. */
+  editBar(t) {
+    const ed = this.edit;
+    if (!ed) return [];
+    const button = (id, label, onClick, strong) => div().id(id).px(8).h(24).flex().flex_none().items_center().rounded(6).text_size(12).cursor_pointer()
+      .bg(strong ? t.accent : t.chrome).text_color(strong ? t.background : t.foreground).hover(s => s.opacity(0.85)).on_click(onClick).child(label);
+    const out = [];
+    if (!ed.editable) return [div().id("files-readonly").flex_none().text_size(11).text_color(t.dim).tooltip(ed.readonly).child("read-only")];
+    if (ed.md) out.push(button("files-mode", ed.mode === "edit" ? "Preview" : "Edit", (_e, cx) => this.setMode(ed.mode === "edit" ? "preview" : "edit", cx)));
+    if (ed.saving) out.push(div().flex_none().text_size(11).text_color(t.dim).child("Saving…"));
+    else if (ed.dirty) out.push(button("files-revert", "Revert", (_e, cx) => this.revert(cx)), button("files-save", "Save", (_e, cx) => this.save(cx), true));
+    else if (ed.note === "Saved") out.push(div().flex_none().text_size(11).text_color(t.ansi2).child("Saved"));
+    return out;
+  }
+
+  /** A line under the header: a save conflict (with its choices) or a failed save. */
+  editNotice(t) {
+    const ed = this.edit;
+    if (ed?.conflict) return h_flex().flex_none().px(14).py(6).gap(8).items_center().border_b(1).border_color(t.border).bg(t.raised).text_size(12)
+      .child(div().flex_1().min_w(0).text_color(t.blocked).child("The file changed on disk since you opened it."))
+      .child(div().id("files-overwrite").px(8).h(22).flex().items_center().rounded(6).cursor_pointer().bg(t.ansi1).text_color(t.background).on_click((_e, cx) => this.save(cx, true)).child("Overwrite"))
+      .child(div().id("files-reload").px(8).h(22).flex().items_center().rounded(6).cursor_pointer().bg(t.chrome).hover(s => s.bg(t.hover)).on_click((_e, cx) => this.revert(cx)).child("Reload"));
+    if (ed?.note && ed.note !== "Saved") return div().flex_none().px(14).py(6).border_b(1).border_color(t.border).text_size(12).text_color(t.ansi1).child(ed.note);
+    return null;
+  }
+
   sized(size, cx) {
     const w = Math.round(size.width);
     if (w !== this.colW) { this.colW = w; cx.notify(); }
@@ -284,17 +406,25 @@ export default class Files extends View {
     if (key() !== this.context?.key) this.refresh(cx);
     const t = theme();
     const font = this.code ? settings() : null;
+    const notice = this.file ? this.editNotice(t) : null;
     return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
+      .on_key_down((e, cx) => {   // fp: save from the editor (cmd is ctrl outside macOS)
+        if (e.keystroke !== "cmd-s" && e.keystroke !== "ctrl-s") return;
+        this.save(cx); cx.stop_propagation();
+      })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
         .child(div().font_semibold().child("Files"))
-        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? ""))
+        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child((this.edit?.dirty || this.edit?.md ? this.file?.split("/").pop() : this.file) ?? this.root?.split(/[\\/]/).pop() ?? ""))   // fp: room for the edit buttons
+        .when(Boolean(this.edit?.dirty), el => el.child(div().flex_none().text_size(11).text_color(t.blocked).child("●")))   // fp: unsaved
+        .children(this.file ? this.editBar(t) : [])
         // fp: the shown file (selected) or the folder in the system file manager
         .when(Boolean(this.root) && !this.on, el => el.child(div().id("files-reveal").p(4).rounded(5).cursor_pointer().hover(s => s.bg(t.hover))
           .on_click(() => this.reveal(this.file ?? "", !this.file)).child(svg("mods/files-fp/folder.svg").size(14).text_color(t.muted)))))
       .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
+      .when(Boolean(notice), el => el.child(notice))
       .when(Boolean(this.file), el => el.child(this.preview(t, font ?? settings())));
   }
 }
