@@ -11,7 +11,7 @@ live Herdr home (`~/.config/herdr-app`, or `HERDR_APP_HOME`).
 | `home/layouts/main-fp.json` | The layout: Herdr's `main` with my Files and Git panels |
 | `home/mods/tabs-fp/` | Tab bar; the Changes button is called Git and shows how many files are uncommitted |
 | `home/mods/files-fp/` | Files panel: edit local text files (ctrl-s saves; Markdown has Edit/Preview), Markdown, Mermaid and image preview, Show in Explorer; files changed in Git, and the folders holding them, are coloured by status |
-| `home/mods/changes-fp/` | Git panel with a Commits tab |
+| `home/mods/changes-fp/` | Git panel with Commits and Worktrees tabs (Worktrees: open one as a space, create or remove with Herdr's worktree dialog) |
 | `home/mods/file-preview/` | [bborrero14/herdr-file-preview](https://github.com/bborrero14/herdr-file-preview) (MIT), fitted to Windows. The others use its Mermaid renderer (`.pele/`) and its enlarged view |
 | `home/keys.json` | Keyboard shortcuts |
 | `scripts/` | The sync tool, Node only, no dependencies |

@@ -1,6 +1,6 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, nextCommand } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, nextCommand, run, openOverlay, home, window } from "herdr";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -38,6 +38,40 @@ const ago = (at) => {
 };
 const dateOf = (at) => new Date(at * 1000).toLocaleString();
 
+// fp: Worktrees tab. Opening, creating and removing follow the shipped worktree mod.
+const slash = (p) => (p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+// Git says C:/Users/x where a pane says c:\Users\x.
+const samePath = (a, b) => (window().platform === "windows" ? a.toLowerCase() === b.toLowerCase() : a === b);
+const inside = (p, dir) => samePath(p, dir) || (p.length > dir.length && samePath(p.slice(0, dir.length + 1), dir + "/"));
+
+// Where a space is now: its first terminal's live folder, else where it was made.
+function place(s, all) {
+  const tabs = new Set((s.tabs ?? []).map((c) => c.id));
+  return all.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder || null;
+}
+
+// The space showing a checkout: its first terminal is in it (the deepest checkout wins).
+function spaceOf(path, trees, on) {
+  const all = panes(), dir = slash(path);
+  return spaces().find((s) => {
+    if ((s.machine ?? null) !== (on ?? null)) return false;
+    const at = slash(place(s, all));
+    return Boolean(at) && inside(at, dir) && !trees.some((w) => slash(w.path).length > dir.length && inside(at, slash(w.path)));
+  });
+}
+
+// `git worktree list --porcelain`: the main checkout first; bare and missing ones dropped.
+function parseWorktrees(out) {
+  return out.split(/\n\n+/).map((block, i) => {
+    const lines = block.split("\n"), field = (k) => lines.find((l) => l === k || l.startsWith(k + " "));
+    const bare = Boolean(field("bare")), lock = field("locked");
+    return {
+      path: field("worktree")?.slice(9), head: field("HEAD")?.slice(5) ?? "", branch: field("branch")?.slice(7).replace(/^refs\/heads\//, "") ?? null,
+      main: i === 0 && !bare, bare, prunable: Boolean(field("prunable")), locked: lock === undefined ? null : lock.slice(7) || "locked",
+    };
+  }).filter((w) => w.path && !w.bare && !w.prunable);
+}
+
 // Numbers each diff line once, so a frame only draws the rows on screen.
 function diffRows(lines) {
   let old = 0, next = 0;
@@ -73,11 +107,13 @@ export default class Changes extends View {
     this.mode = "changes"; this.cv = rowsOf([]);   // fp
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
-    // fp: "changes-fp.<cmd>" (keys.json or herdr-app do): changes, commits, commit:<n>, file:<n>, back, more.
+    // fp: "changes-fp.<cmd>" (keys.json or herdr-app do): changes, commits, worktrees, commit:<n>, file:<n>, worktree:<n>, new-worktree, back, more.
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
-        if (c === "changes" || c === "commits") this.setMode(c, cx);
+        if (c === "changes" || c === "commits" || c === "worktrees") this.setMode(c, cx);
+        else if (c?.startsWith("worktree:") && this.trees?.[Number(c.slice(9))]) this.openTree(this.trees[Number(c.slice(9))]);
+        else if (c === "new-worktree") this.worktreeDialog("new", this.root);
         else if (c?.startsWith("commit:") && this.commits?.[Number(c.slice(7))]) this.openCommit(this.commits[Number(c.slice(7))], cx);
         else if (c?.startsWith("file:") && this.cfiles?.[Number(c.slice(5))]) await this.pickCommitFile(this.cfiles[Number(c.slice(5))].path, cx);
         else if (c === "back") this.closeCommit();
@@ -111,7 +147,7 @@ export default class Changes extends View {
       this.context = { key: next }; this.root = null; this.files = []; this.open = null;
       this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false;
       this.loading = false;
-      this.commits = null; this.closeCommit(); this.unpushed = null; this.headSha = null; this.logMore = false; this.logError = null;   // fp
+      this.commits = null; this.closeCommit(); this.unpushed = null; this.headSha = null; this.logMore = false; this.logError = null; this.trees = null; this.treesError = null;   // fp
     }
     // A load left behind in another folder (a slow git, a read that never ends) must not hold this one.
     if (!cwd || this.loading || this.busy) return;
@@ -151,6 +187,7 @@ export default class Changes extends View {
         this.watch(root, cx);
         // fp: the Commits tab follows new commits.
         if (this.mode === "commits" && (head.code === 0 ? head.stdout.trim() : null) !== this.headSha) this.loadLog(context, cx, false);
+        if (this.mode === "worktrees") this.loadTrees(context, cx);
         if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.setLines([]); }
         // The first file's diff shows until you pick another.
         if (!this.open && !this.closed && files.length) this.open = files[0].path;
@@ -235,6 +272,7 @@ export default class Changes extends View {
     if (this.mode === mode) return;
     this.mode = mode; this.note = null;
     if (mode === "commits" && !this.commits) this.loadLog(this.context, cx, false);
+    if (mode === "worktrees") this.loadTrees(this.context, cx);
     cx.notify();
   }
 
@@ -314,6 +352,70 @@ export default class Changes extends View {
     this.cv = rowsOf(lines.slice(0, 1500).map((l) => (l.length > 4000 ? l.slice(0, 4000) + "… (line truncated)" : l)));
   }
 
+  // ——— fp: Worktrees tab (not upstream). Reads only; changes go through the shipped worktree dialog.
+
+  loadTrees(context, cx) {
+    if (!this.root || this.treesLoading) return;
+    const root = this.root, on = this.on;
+    const git = (cwd, args) => exec("git", [...READ, ...args], { cwd, on });
+    this.treesLoading = true;
+    cx.spawn(async (cx) => {
+      try {
+        const r = await git(root, ["worktree", "list", "--porcelain"]);
+        if (!this.current(context)) return;
+        if (r.code !== 0) throw new Error((r.stderr || "git worktree list failed").trim());
+        const list = parseWorktrees(r.stdout);
+        await Promise.all(list.slice(0, 30).map(async (w) => {
+          const [st, ab] = await Promise.all([
+            git(w.path, ["status", "--porcelain"]).catch(() => null),
+            w.branch ? git(w.path, ["rev-list", "--left-right", "--count", "HEAD...@{u}"]).catch(() => null) : null,   // no upstream: no arrows
+          ]);
+          if (st?.code === 0) w.dirty = countLines(st.stdout);
+          if (ab?.code === 0) [w.ahead, w.behind] = ab.stdout.trim().split(/\s+/).map(Number);
+        }));
+        if (!this.current(context)) return;
+        this.trees = list; this.treesError = null;
+      } catch (e) { if (this.current(context)) { this.trees = []; this.treesError = String(e?.message ?? e); } }
+      finally { this.treesLoading = false; cx.notify(); }
+    });
+  }
+
+  openTree(w) {
+    const s = spaceOf(w.path, this.trees ?? [], this.on);
+    if (s) run("space.select", { id: s.id });
+    else run("space.new", { folder: w.path, machine: this.on ?? "" });   // unnamed, so the sidebar nests it under its repo
+  }
+
+  worktreeDialog(action, folder) {
+    if (!folder) return;
+    const space = action === "remove" ? spaceOf(folder, this.trees ?? [], this.on) : spaces().find((s) => s.active);
+    openOverlay({ mod: "worktree", kind: "dialog", width: action === "new" ? 460 : 440, height: action === "new" ? 280 : 260, props: { space: space?.id, folder, machine: this.on, action } });
+  }
+
+  treeRows(t) {
+    const userHome = this.on ? null : slash(home()), root = slash(this.root);
+    const badge = (text, color) => div().flex_none().px(5).rounded(4).border_1().border_color(t.border).text_size(10).text_color(color).child(text);
+    return (this.trees ?? []).map((w, i) => {
+      const path = slash(w.path), here = samePath(path, root), there = !here && spaceOf(w.path, this.trees, this.on);
+      const shown = userHome && inside(path, userHome) ? "~" + path.slice(userHome.length) : path;
+      return h_flex().id(`tree-${i}`).h(44).flex_none().pl(8).pr(4).gap(4).items_center().rounded(7).when(here, (e) => e.bg(t.selected)).when(!here, (e) => e.hover((s) => s.bg(t.hover)))
+        .child(v_flex().id(`tree-open-${i}`).flex_1().min_w(0).h_full().justify_center().cursor_pointer().on_click(() => this.openTree(w))
+          .child(h_flex().gap(6).items_center()
+            .child(div().min_w(0).truncate().when(here, (e) => e.font_semibold()).child(w.branch ?? `detached ${w.head.slice(0, 7)}`))
+            .when(w.main, (e) => e.child(badge("main", t.dim)))
+            .when(Boolean(w.locked), (e) => e.child(badge("locked", t.blocked)))
+            .child(div().flex_1())
+            .when(w.dirty > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.blocked).child(`${w.dirty} changed`)))
+            .when(w.ahead > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi3).child(`↑${w.ahead}`)))
+            .when(w.behind > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi4).child(`↓${w.behind}`)))
+            .when(here, (e) => e.child(div().flex_none().text_size(11).text_color(t.accent).child("here")))
+            .when(Boolean(there), (e) => e.child(div().flex_none().text_size(11).text_color(t.accent).child("open"))))
+          .child(div().truncate().text_size(11).text_color(t.dim).child(shown)))
+        .when(!w.main, (e) => e.child(div().id(`tree-remove-${i}`).size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer().text_color(t.dim)
+          .hover((s) => s.bg(t.raised)).on_click(() => this.worktreeDialog("remove", w.path)).child("×")));
+    });
+  }
+
   closeCommit() { this.sel = null; this.cfiles = null; this.copen = null; this.cv = rowsOf([]); }
 
   tab(mode, label, t) {
@@ -360,39 +462,43 @@ export default class Changes extends View {
     if (key() !== this.context?.key) this.refresh(cx);
     const t = theme(), size = settings().font_size, add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
     const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
-    const commits = this.mode === "commits";
+    const commits = this.mode === "commits", trees = this.mode === "worktrees", changes = !commits && !trees;
     const v = commits ? this.cv : { rows: this.rows, longest: this.longest, gutterChars: this.gutterChars };
     const listId = commits ? "changes-clist" : "changes-list", diffId = commits ? "changes-cdiff" : "changes-diff";
-    const listRows = commits ? this.commitRows(t) : this.files.map((f) => this.fileRow(f, this.open === f.path, (cx) => this.pick(f.path, cx), t, `change-${f.path}`));
+    const listRows = trees ? this.treeRows(t) : commits ? this.commitRows(t) : this.files.map((f) => this.fileRow(f, this.open === f.path, (cx) => this.pick(f.path, cx), t, `change-${f.path}`));
     const count = commits ? (this.sel ? (this.cfiles?.length ?? 0) + 2 : (this.commits?.length ?? 0) + (this.logMore ? 1 : 0)) : this.files.length;
-    const empty = commits
+    const empty = trees
+      ? (this.trees?.length ? null : this.treesError || (this.trees ? "No worktrees" : this.root ? "Loading worktrees…" : this.error || "No folder"))
+      : commits
       ? (this.sel ? (this.cfiles ? (this.cfiles.length ? null : "No file changes") : "Loading commit…") : (this.commits?.length ? null : this.logError || (this.root ? "Loading commits…" : this.error || "No folder")))
       : (this.files.length ? null : this.error || (this.loading ? "Loading changes…" : this.root ? "No uncommitted changes" : "No folder"));
-    const hint = commits ? (!this.sel && this.commits?.length ? "Select a commit to see its changes" : null) : (!this.open && this.files.length > 0 ? "Select a file to view its changes" : null);
+    const hint = trees ? null : commits ? (!this.sel && this.commits?.length ? "Select a commit to see its changes" : null) : (!this.open && this.files.length > 0 ? "Select a file to view its changes" : null);
     const sAdd = (this.cfiles ?? []).reduce((n, f) => n + f.add, 0), sDel = (this.cfiles ?? []).reduce((n, f) => n + f.del, 0);
     return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
       })
       .child(h_flex().h(42).flex_none().px(10).gap(4).items_center().border_b(1).border_color(t.border)
-        .child(this.tab("changes", "Changes", t)).child(this.tab("commits", "Commits", t))
-        .when(!commits, (e) => e.child(div().ml(4).px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} files`)))
+        .child(this.tab("changes", "Changes", t)).child(this.tab("commits", "Commits", t)).child(this.tab("worktrees", "Worktrees", t))
+        .when(changes, (e) => e.child(div().ml(4).px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} files`)))
         .when(commits && this.unpushed?.size > 0, (e) => e.child(div().ml(4).px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.ansi3).child(`↑${this.unpushed.size} not pushed`)))
         .child(div().flex_1())
-        .when(!commits || Boolean(this.sel), (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${commits ? sAdd : add}`)).child(div().text_size(11).text_color(t.ansi1).child(`−${commits ? sDel : del}`))))
+        .when(trees && Boolean(this.root), (e) => e.child(div().id("new-worktree").h(24).px(8).flex().items_center().rounded(6).cursor_pointer().text_size(12).text_color(t.accent)
+          .hover((s) => s.bg(t.hover)).on_click(() => this.worktreeDialog("new", this.root)).child("+ New worktree")))
+        .when(changes || (commits && Boolean(this.sel)), (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${commits ? sAdd : add}`)).child(div().text_size(11).text_color(t.ansi1).child(`−${commits ? sDel : del}`))))
       // overflow_y_scrollbar() wraps the list, so its flex sizing never reached the panel's layout.
-      .child(div().flex_1().min_h(44).max_h(count * 28 + 12).relative().border_b(1).border_color(t.border)
+      .child(div().flex_1().min_h(44).when(!trees, (e) => e.max_h(count * 28 + 12)).relative().border_b(1).border_color(t.border)
         .child(v_flex().id(listId).absolute().inset_0().overflow_y_scroll().p(6).children(listRows).when(Boolean(empty), (e) => e.child(div().p(8).text_color(t.dim).child(empty))))
         .child(Scrollbar.vertical(listId).absolute().inset_0()))
-      .when(!commits && this.limited, el => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
-      .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(size)
+      .when(changes && this.limited, el => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
+      .when(!trees, (diff) => diff.child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(size)
         .child(div().id(`${diffId}-x`).size_full().overflow_x_scrollbar()
           .child(div().w_full().min_w(Math.max(300, v.longest * charWidth(size) + this.gutter(size, v.gutterChars) + 20)).h_full().child(v_virtual_list(diffId, v.rows.length, rowHeight(size), (i) => String(i),
             (range) => v.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t, size, v.gutterChars))).size_full())))
         .child(Scrollbar.vertical(diffId).viewport_from_layout().absolute().inset_0())
-        .when(Boolean(hint), (e) => e.child(div().absolute().top(6).px(12).text_size(11).text_color(t.dim).child(hint))))
+        .when(Boolean(hint), (e) => e.child(div().absolute().top(6).px(12).text_size(11).text_color(t.dim).child(hint)))))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
-      .when(!commits, (e) => e.child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
+      .when(changes, (e) => e.child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
         .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
         .child(div().id("commit").h(32).px(14).flex().items_center().rounded(8).bg(enabled ? t.solid : t.raised).text_color(enabled ? t.solid_foreground : t.dim).text_size(12).when(enabled, (e) => e.cursor_pointer()).on_click((_e, cx) => this.commit(cx)).child(this.busy ? "Committing…" : "Commit"))));
   }
