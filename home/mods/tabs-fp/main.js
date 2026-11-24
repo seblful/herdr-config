@@ -20,7 +20,8 @@ function previewTip(mac) {
   return "Open or close the file preview" + (k ? ` (${shortcut(k.keys, mac)})` : "");
 }
 
-// fp: the folder the Git panel shows (the focused pane's, as in changes-fp), for the Git button's count.
+// fp: the folder the Git panel shows, for the Git button's count. A copy of location() in changes-fp/main.js
+// and READ in changes-fp/git.js: Herdr refuses imports from another mod's folder.
 function location() {
   const space = spaces().find(s => s.active), f = focused();
   const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
@@ -161,6 +162,9 @@ export default class Tabs extends View {
       : 10;
     const panel = find(root, "panel"), body = find(root, "panel-body");
     const enabled = shared("workspace.panels") ?? ["files", "changes"];
+    // fp: dividers keep + with the tabs it opens, apart from the panel buttons and the window's.
+    const divider = () => div().w(1).h(16).mx(4).flex_none().bg(t.border);
+    const panels = enabled.includes("files") || enabled.includes("changes") || Boolean(find(root, PREVIEW));
     this.syncPanel(space, panel, body, enabled);
     this.syncWidth(shown.find(c => c.active), panel);
     const panelButton = (id, label, icon, tip, badge) => {
@@ -182,10 +186,11 @@ export default class Tabs extends View {
       .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().children(shown.map(item)))
       .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
+      .when(panels, el => el.child(divider()))
       .when(enabled.includes("files"), el => el.child(panelButton("files", "Files", "mods/files/file.svg")))
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Git", "mods/changes/changes.svg", this.dirty ? `${this.dirty} uncommitted ${this.dirty === 1 ? "change" : "changes"}` : null, this.dirty ? (this.dirty > 99 ? "99+" : String(this.dirty)) : null)))
       .when(Boolean(find(root, PREVIEW)), el => el.child(panelButton(PREVIEW, "Preview", "mods/file-preview/icons/file-md.svg", previewTip(w?.platform === "macos"))))
-      .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs-fp/win-min.svg").size(16) : "−", () => run("window.minimize")))
+      .when(w?.buttons, el => el.child(divider()).child(button("minimize", w.platform === "windows" ? svg("mods/tabs-fp/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs-fp/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
         .child(button("close-window", w.platform === "windows" ? svg("mods/tabs-fp/win-close.svg").size(16) : svg("mods/pane/close.svg").size(13), () => run("window.close"))));
   }

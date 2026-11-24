@@ -11,6 +11,7 @@
     "deploy": "node scripts/herdr.mjs deploy",
     "capture": "node scripts/herdr.mjs capture",
     "add": "node scripts/herdr.mjs add",
-    "check": "node scripts/herdr.mjs check"
+    "check": "node scripts/herdr.mjs check",
+    "test": "node --test test/"
   }
 }

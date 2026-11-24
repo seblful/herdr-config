@@ -9,12 +9,13 @@ live Herdr home (`~/.config/herdr-app`, or `HERDR_APP_HOME`).
 | Path | What it is |
 |:--|:--|
 | `home/layouts/main-fp.json` | The layout: Herdr's `main` with my Files and Git panels |
-| `home/mods/tabs-fp/` | Tab bar; the Changes button is called Git and shows how many files are uncommitted |
+| `home/mods/tabs-fp/` | Tab bar; the Changes button is called Git and shows how many files are uncommitted. Dividers separate the tabs and `+`, the panel buttons, and the window buttons |
 | `home/mods/files-fp/` | Files panel: edit local text files (ctrl-s saves; Markdown has Edit/Preview), Markdown, Mermaid and image preview, Show in Explorer; files changed in Git, and the folders holding them, are coloured by status |
-| `home/mods/changes-fp/` | Git panel with Commits and Worktrees tabs (Worktrees: open one as a space, create or remove with Herdr's worktree dialog) |
+| `home/mods/changes-fp/` | Git panel. On top, the branch with ↑/↓ against its upstream and Fetch, Pull (fast-forward only) and Push or Publish; click the branch for its worktrees (open one as a space, create or remove with Herdr's worktree dialog). Below, Changes and History tabs; Commit all commits every listed file. `git.js` runs git, `parse.js` reads its output, `ui.js` draws, `main.js` holds the state |
 | `home/mods/file-preview/` | [bborrero14/herdr-file-preview](https://github.com/bborrero14/herdr-file-preview) (MIT), fitted to Windows. The others use its Mermaid renderer (`.pele/`) and its enlarged view |
 | `home/keys.json` | Keyboard shortcuts |
 | `scripts/` | The sync tool, Node only, no dependencies |
+| `test/` | Tests for the mods' code that runs without Herdr: `npm test` |
 
 `home/` mirrors the Herdr home. Anything under it is deployed to the same place.
 
@@ -41,6 +42,7 @@ and runs `herdr-app check` on each mod. If it replaces files the machine already
 | Changed something in the app, or Claude changed a mod | `npm run capture`, then commit and push |
 | Pulled changes on another machine | `npm run deploy` |
 | Not sure which side changed | `npm run status` |
+| Changed a mod's parsing | `npm test` |
 
 `status` lists every file that differs and which side is newer. It also lists mods, layouts and
 themes you have that the repo doesn't track yet.

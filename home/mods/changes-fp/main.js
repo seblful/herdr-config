@@ -1,130 +1,130 @@
+// The Git panel: the branch and its worktrees, uncommitted changes with their diffs, and the history.
+// Started as a clone of Herdr's changes mod (0.1.17). git.js runs git, parse.js reads its output, ui.js draws.
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, nextCommand, run, openOverlay, home, window } from "herdr";
+import { v_flex, InputState } from "gpui-base";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, nextCommand, run, openOverlay, home, window, checking } from "herdr";
+import { EMPTY_DIFF, diffView, clip, slash, inside, samePath } from "./parse.js";
+import * as git from "./git.js";
+import * as ui from "./ui.js";
 
+/** The folder the panel shows: the focused pane's, else its space's; and the machine it's on. */
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
-  const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
+  const pane = f?.pane ? panes().find((p) => p.pane === f.pane) : null;
   const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on };
 }
-const key = () => JSON.stringify(location());
-// Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie):
-// the folder watch would see it, and every refresh would start the next one.
-const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
-const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
-const wideGlyph = /[\p{Ideographic}\p{Emoji_Presentation}\p{Extended_Pictographic}\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\ufe10-\ufe19\ufe30-\ufe6f\uff01-\uff60\uffe0-\uffe6]/gu;
+const where = () => JSON.stringify(location());
+const caseless = () => window().platform === "windows";
 
-// Keep room for spacing marks and give wide glyphs at least two columns.
-function displayColumns(text) {
-  let columns = text.length;
-  for (const glyph of text.match(wideGlyph) ?? []) {
-    if (glyph.length === 1) columns++;
-  }
-  return columns;
-}
-
-// The diff was laid out for 11px text: 20px rows, 7px characters.
-const rowHeight = size => Math.ceil(size * 1.8), charWidth = size => size * 0.64;
-
-// Text draws a tab as nothing: pad each to the next 4-column stop.
-const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
-
-// fp (not upstream): Commits tab. Merge commits diff against their first parent.
-const LOG_PAGE = 100, MERGES = ["--diff-merges=first-parent"];
-const ago = (at) => {
-  const s = Math.max(0, Date.now() / 1000 - at);
-  return s < 60 ? "now" : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : s < 2592000 ? `${Math.floor(s / 86400)}d` : new Date(at * 1000).toISOString().slice(0, 10);
-};
-const dateOf = (at) => new Date(at * 1000).toLocaleString();
-
-// fp: Worktrees tab. Opening, creating and removing follow the shipped worktree mod.
-const slash = (p) => (p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
-// Git says C:/Users/x where a pane says c:\Users\x.
-const samePath = (a, b) => (window().platform === "windows" ? a.toLowerCase() === b.toLowerCase() : a === b);
-const inside = (p, dir) => samePath(p, dir) || (p.length > dir.length && samePath(p.slice(0, dir.length + 1), dir + "/"));
-
-// Where a space is now: its first terminal's live folder, else where it was made.
-function place(s, all) {
-  const tabs = new Set((s.tabs ?? []).map((c) => c.id));
-  return all.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder || null;
-}
-
-// The space showing a checkout: its first terminal is in it (the deepest checkout wins).
+/** The space showing a checkout: its first terminal is in it, and the deepest checkout wins. */
 function spaceOf(path, trees, on) {
   const all = panes(), dir = slash(path);
+  const placeOf = (s) => { const tabs = new Set((s.tabs ?? []).map((c) => c.id)); return all.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder || null; };
   return spaces().find((s) => {
     if ((s.machine ?? null) !== (on ?? null)) return false;
-    const at = slash(place(s, all));
-    return Boolean(at) && inside(at, dir) && !trees.some((w) => slash(w.path).length > dir.length && inside(at, slash(w.path)));
+    const at = slash(placeOf(s));
+    return Boolean(at) && inside(at, dir, caseless()) && !trees.some((w) => slash(w.path).length > dir.length && inside(at, slash(w.path), caseless()));
   });
 }
 
-// `git worktree list --porcelain`: the main checkout first; bare and missing ones dropped.
-function parseWorktrees(out) {
-  return out.split(/\n\n+/).map((block, i) => {
-    const lines = block.split("\n"), field = (k) => lines.find((l) => l === k || l.startsWith(k + " "));
-    const bare = Boolean(field("bare")), lock = field("locked");
-    return {
-      path: field("worktree")?.slice(9), head: field("HEAD")?.slice(5) ?? "", branch: field("branch")?.slice(7).replace(/^refs\/heads\//, "") ?? null,
-      main: i === 0 && !bare, bare, prunable: Boolean(field("prunable")), locked: lock === undefined ? null : lock.slice(7) || "locked",
-    };
-  }).filter((w) => w.path && !w.bare && !w.prunable);
-}
-
-// Numbers each diff line once, so a frame only draws the rows on screen.
-function diffRows(lines) {
-  let old = 0, next = 0;
-  return lines.map((line) => {
-    const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
-    if (match) { old = +match[1]; next = +match[2]; return { kind: "@", text: line }; }
-    const kind = line[0];
-    if (kind === "-") return { kind, number: old++, text: untab(line.slice(1)) || " " };
-    if (kind === "+") return { kind, number: next++, text: untab(line.slice(1)) || " " };
-    if (kind === " ") { old++; return { kind, number: next++, text: untab(line.slice(1)) || " " }; }
-    return { kind: "", text: line };
-  });
-}
-
-// fp: rows, widest line and gutter width of a diff, for one diff view.
-function rowsOf(lines) {
-  const rows = diffRows(lines);
-  return { rows, longest: Math.max(0, ...rows.map((r) => displayColumns(r.text))), gutterChars: Math.max(4, String(Math.max(0, ...rows.map((r) => r.number ?? 0))).length) };
-}
+// Everything read from one folder. A new folder starts from these, so nothing from the last one shows.
+const fresh = () => ({
+  repo: { git: null, root: null, headSha: null, files: [], limited: false, error: null },
+  branch: { branch: null, upstream: null, ahead: 0, behind: 0, remote: null },
+  changes: { open: null, closed: false, view: EMPTY_DIFF },
+  history: { commits: null, more: false, error: null, unpushed: new Set(), headSha: null, loading: false, sel: null, files: null, open: null, view: EMPTY_DIFF },
+  trees: { list: null, error: null, loading: false },
+});
 
 export default class Changes extends View {
   init(_props, cx) {
-    this.files = []; this.rows = []; this.longest = 0; this.gutterChars = 4; this.message = ""; this.handle = cx.focus_handle();
+    Object.assign(this, fresh());
+    this.mode = "changes";       // or "history"
+    this.menu = false;           // the worktree list is open
+    this.sync = null;            // { op, context } while a fetch, pull or push runs
+    this.committing = false;
+    this.note = null;            // the last action's error
+    this.message = "";
+    this.handle = cx.focus_handle();
     this.input = InputState.new({ placeholder: "Commit message" });
     this.input.on("change", (_e, cx) => {
-      const hadMessage = Boolean(this.message.trim());
+      const had = Boolean(this.message.trim());
       this.message = this.input.value();
-      if (hadMessage !== Boolean(this.message.trim())) cx.notify();
+      if (had !== Boolean(this.message.trim())) cx.notify();
     });
     this.input.on("submit", (_e, cx) => this.commit(cx));
     this.input.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
-    this.mode = "changes"; this.cv = rowsOf([]);   // fp
+    if (checking()) return;
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
-    // fp: "changes-fp.<cmd>" (keys.json or herdr-app do): changes, commits, worktrees, commit:<n>, file:<n>, worktree:<n>, new-worktree, back, more.
+    cx.spawn(async (cx) => { for (;;) { this.command(await nextCommand(), cx); cx.notify(); } });
+  }
+
+  /**
+   * "changes-fp.<command>" from keys.json or `herdr-app do`: changes, history (or commits), worktrees (opens or
+   * closes the list), fetch, pull, push, commit:<n>, file:<n>, worktree:<n>, new-worktree, back, more.
+   */
+  command(c, cx) {
+    const [name, arg] = (c ?? "").split(":"), n = Number(arg), h = this.history;
+    if (name === "changes" || name === "history" || name === "commits") this.setMode(name === "changes" ? "changes" : "history", cx);
+    else if (name === "worktrees") this.toggleMenu(cx);
+    else if (name === "fetch" || name === "pull" || name === "push") this.syncWith(name, cx);
+    else if (name === "worktree" && this.trees.list?.[n]) this.openTree(this.trees.list[n]);
+    else if (name === "new-worktree") this.worktreeDialog("new", this.repo.root);
+    else if (name === "commit" && h.commits?.[n]) this.openCommit(h.commits[n], cx);
+    else if (name === "file" && h.files?.[n]) this.pickCommitFile(h.files[n].path, cx);
+    else if (name === "back") this.closeCommit();
+    else if (name === "more") this.loadHistory(cx, true);
+  }
+
+  // ——— Reading the folder
+
+  /** One visit to a folder: what an earlier visit to the same folder read is stale too. */
+  current(context) { return this.context === context && where() === context.key; }
+
+  refresh(cx) {
+    const { cwd, on } = location(), key = JSON.stringify({ cwd, on });
+    if (key !== this.context?.key) {
+      Object.assign(this, fresh());
+      this.context = { key }; this.menu = false; this.note = null; this.watched = null;
+      this.message = ""; this.input.set_value("");
+      // A load left behind in another folder (a slow git, a read that never ends) must not hold this one.
+      this.loading = false; this.queued = false;
+    }
+    if (!cwd || this.committing) return;
+    // Asked for meanwhile (a fetch or push just ended): it runs as soon as this one ends.
+    if (this.loading) { this.queued = true; return; }
+    const context = this.context;
+    this.loading = true;
     cx.spawn(async (cx) => {
-      for (;;) {
-        const c = await nextCommand();
-        if (c === "changes" || c === "commits" || c === "worktrees") this.setMode(c, cx);
-        else if (c?.startsWith("worktree:") && this.trees?.[Number(c.slice(9))]) this.openTree(this.trees[Number(c.slice(9))]);
-        else if (c === "new-worktree") this.worktreeDialog("new", this.root);
-        else if (c?.startsWith("commit:") && this.commits?.[Number(c.slice(7))]) this.openCommit(this.commits[Number(c.slice(7))], cx);
-        else if (c?.startsWith("file:") && this.cfiles?.[Number(c.slice(5))]) await this.pickCommitFile(this.cfiles[Number(c.slice(5))].path, cx);
-        else if (c === "back") this.closeCommit();
-        else if (c === "more") this.loadLog(this.context, cx, true);
+      try {
+        const root = await git.findRoot(git.gitAt(exec, cwd, on));
+        if (!this.current(context)) return;
+        if (!root) { Object.assign(this, fresh()); this.repo.error = "Not a git repository"; return; }
+        const repo = git.gitAt(exec, root, on);
+        const readText = (p) => readTextFile(p, { on });
+        const [changes, branch] = await Promise.all([git.readChanges(repo, readText), git.readBranch(repo)]);
+        if (!this.current(context)) return;
+        this.repo = { git: repo, root, ...changes, error: null };
+        this.branch = branch;
+        this.watch(root, cx);
+        if (this.mode === "history" && (changes.headSha !== this.history.headSha || this.historyStale())) this.loadHistory(cx, false);
+        if (this.menu) this.loadTrees(cx);
+        await this.showChanges(context);
+      } catch (e) { if (this.current(context)) this.repo.error = String(e?.message ?? e); }
+      finally {
+        if (this.context === context) this.loading = false;
+        if (this.queued && !this.loading) { this.queued = false; this.refresh(cx); }
         cx.notify();
       }
     });
   }
 
+  /** Refresh whenever anything in a local repository changes; a remote one waits for the timer. */
   watch(root, cx) {
-    if (this.on || this.watched === root) return;
+    if (this.repo.git.on || this.watched === root) return;
     this.watched = root;
     cx.spawn(async (cx) => {
       try {
@@ -136,370 +136,227 @@ export default class Changes extends View {
     });
   }
 
-  // One visit to a folder: results from an earlier visit to the same folder are stale too.
-  current(context) {
-    return this.context === context && key() === context.key;
+  // ——— Changes
+
+  /** Keep the open file's diff current; the first file opens until another is picked or it's closed. */
+  async showChanges(context) {
+    const c = this.changes, files = this.repo.files;
+    if (c.open && !files.some((f) => f.path === c.open)) { c.open = null; c.view = EMPTY_DIFF; }
+    if (!c.open && !c.closed && files.length) c.open = files[0].path;
+    if (!c.open) return;
+    try { await this.loadDiff(c.open, context); }
+    catch { if (this.current(context)) c.view = diffView(["Cannot preview this diff (too large or unreadable)"]); }
   }
 
-  refresh(cx) {
-    const { cwd, on } = location(), next = key();
-    if (next !== this.context?.key) {
-      this.context = { key: next }; this.root = null; this.files = []; this.open = null;
-      this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false;
-      this.loading = false;
-      this.commits = null; this.closeCommit(); this.unpushed = null; this.headSha = null; this.logMore = false; this.logError = null; this.trees = null; this.treesError = null;   // fp
-    }
-    // A load left behind in another folder (a slow git, a read that never ends) must not hold this one.
-    if (!cwd || this.loading || this.busy) return;
-    const context = this.context;
-    this.loading = true;
-    cx.spawn(async (cx) => {
-      try {
-        const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
-        if (!this.current(context)) return;
-        if (top.code !== 0) { this.root = null; this.files = []; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
-        const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
-        const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
-        if (status.code !== 0) throw new Error(status.stderr);
-        const head = await git(["rev-parse", "--verify", "HEAD"]);
-        const stats = {};
-        const results = head.code === 0 ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
-        for (const result of results) {
-          if (result.code !== 0) throw new Error(result.stderr);
-          for (const entry of result.stdout.split("\0")) {
-            const [a, d, ...parts] = entry.split("\t");
-            if (!parts.length) continue;
-            const path = parts.join("\t"), old = stats[path] ?? { add: 0, del: 0 };
-            stats[path] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
-          }
-        }
-        const files = [];
-        const entries = status.stdout.split("\0").filter(Boolean);
-        for (const entry of entries.slice(0, 1000)) {
-          const xy = entry.slice(0, 2), path = entry.slice(3), fresh = xy === "??";
-          const conflict = xy.includes("U") || xy === "AA" || xy === "DD";
-          const s = conflict ? "U" : xy.includes("D") ? "D" : fresh || xy.includes("A") ? "A" : "M";
-          const stat = stats[path] ?? { add: 0, del: 0 };
-          files.push({ path, status: s, fresh, ...stat });
-        }
-        if (!this.current(context)) return;
-        this.root = root; this.on = on; this.hasHead = head.code === 0; this.files = files; this.limited = entries.length > 1000; this.error = null;
-        this.watch(root, cx);
-        // fp: the Commits tab follows new commits.
-        if (this.mode === "commits" && (head.code === 0 ? head.stdout.trim() : null) !== this.headSha) this.loadLog(context, cx, false);
-        if (this.mode === "worktrees") this.loadTrees(context, cx);
-        if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.setLines([]); }
-        // The first file's diff shows until you pick another.
-        if (!this.open && !this.closed && files.length) this.open = files[0].path;
-        if (this.open) {
-          try { await this.load(this.open, context); }
-          catch { if (this.current(context)) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
-        }
-      } catch (e) { if (this.current(context)) this.error = String(e); }
-      finally { if (this.context === context) this.loading = false; cx.notify(); }
-    });
-  }
-
-  async load(path, context) {
-    const file = this.files.find((f) => f.path === path), root = this.root, on = this.on;
+  async loadDiff(path, context) {
+    const file = this.repo.files.find((f) => f.path === path), repo = this.repo.git;
     if (!file) return;
-    let lines;
-    if (file.fresh || (!this.hasHead && file.status === "A")) {
-      const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
-      if (text === null) lines = ["Cannot preview this file (binary, too large, or unreadable)"];
-      else if (text.includes("\0")) lines = ["Binary file · no text diff"];
-      else {
-        file.add = countLines(text);
-        lines = [`@@ -0,0 +1,${file.add} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map(l => `+${l}`)];
-      }
-    } else {
-      const r = await exec("git", [...READ, "diff", ...(this.hasHead ? ["HEAD"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", path], { cwd: root, on });
-      if (r.code !== 0) throw new Error(r.stderr);
-      const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
-      lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
-    }
-    if (this.current(context) && this.open === path) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
-  }
-
-  setLines(lines) {
-    this.rows = diffRows(lines);
-    this.longest = Math.max(0, ...this.rows.map(row => displayColumns(row.text)));
-    this.gutterChars = Math.max(4, String(Math.max(0, ...this.rows.map(row => row.number ?? 0))).length);
+    const { lines, added } = await git.readFileDiff(repo, file, Boolean(this.repo.headSha), (p) => readTextFile(p, { on: repo.on }));
+    if (added !== undefined) file.add = added;
+    if (this.current(context) && this.changes.open === path) this.changes.view = diffView(clip(lines));
   }
 
   pick(path, cx) {
-    this.open = this.open === path ? null : path; this.setLines([]); this.note = null;
-    this.closed = !this.open;
-    const context = this.context;
-    if (this.open) cx.spawn(async (cx) => {
-      try { await this.load(path, context); }
-      catch (e) { if (this.current(context) && this.open === path) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
+    const c = this.changes, context = this.context;
+    c.open = c.open === path ? null : path; c.closed = !c.open; c.view = EMPTY_DIFF; this.note = null;
+    if (c.open) cx.spawn(async (cx) => {
+      try { await this.loadDiff(path, context); }
+      catch (e) { if (this.current(context) && c.open === path) this.note = `Cannot preview this diff (too large or unreadable): ${e?.message ?? e}`; }
       cx.notify();
     });
     cx.notify();
   }
 
   commit(cx) {
-    if (!this.message.trim() || !this.root || this.busy || this.loading || this.context?.key !== key()) return;
-    const root = this.root, on = this.on, context = this.context, message = this.message.trim();
-    this.busy = true; this.note = null;
+    const repo = this.repo.git, message = this.message.trim(), context = this.context;
+    if (!message || !repo || this.committing || this.loading || context?.key !== where()) return;
+    this.committing = true; this.note = null;
     cx.spawn(async (cx) => {
       try {
-        for (const args of [["add", "-A"], ["commit", "-m", message]]) {
-          const r = await exec("git", args, { cwd: root, on });
-          if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
-        }
+        await git.commitAll(repo, message);
         if (this.current(context)) { this.message = ""; this.input.set_value(""); }
-      } catch (e) { if (this.current(context)) this.note = `Commit failed: ${e}`; }
-      finally { this.busy = false; this.refresh(cx); cx.notify(); }
+      } catch (e) { if (this.current(context)) this.note = `Commit failed: ${e?.message ?? e}`; }
+      finally { this.committing = false; this.refresh(cx); cx.notify(); }
     });
     cx.notify();
   }
 
-  gutter(size, chars = this.gutterChars) { return Math.ceil(chars * charWidth(size)) + 2; }
+  // ——— The branch: fetch, pull, push, and its worktrees
 
-  diffRow({ kind, number, text }, t, size, chars) {
-    const height = rowHeight(size);
-    if (kind === "@") return div().w_full().px(12).h(height).flex_none().truncate().bg(t.raised).text_color(t.dim).child(text);
-    return h_flex().w_full().h(height).flex_none().gap(10).when(kind === "+", (e) => e.bg(t.ansi2 + "18")).when(kind === "-", (e) => e.bg(t.ansi1 + "18"))
-      .child(div().w(this.gutter(size, chars)).flex_none().text_right().text_color(t.dim).child(number === undefined ? "" : String(number)))
-      .child(div().flex_1().min_w(0).truncate().child(text));
+  syncWith(op, cx) {
+    const repo = this.repo.git, context = this.context, branch = { ...this.branch, hasHead: Boolean(this.repo.headSha) };
+    if (!repo || this.sync || this.committing || context?.key !== where()) return;
+    this.sync = { op, context }; this.note = null;
+    cx.spawn(async (cx) => {
+      try { await git.sync(repo, op, branch); }
+      catch (e) { if (this.current(context)) this.note = `${op[0].toUpperCase() + op.slice(1)} failed: ${e?.message ?? e}`; }
+      finally { this.sync = null; this.refresh(cx); cx.notify(); }
+    });
+    cx.notify();
   }
 
-  // ——— fp: Commits tab (not upstream). Read-only: log, show; nothing under .git is written.
+  toggleMenu(cx) {
+    this.menu = !this.menu && Boolean(this.repo.root);
+    if (this.menu) this.loadTrees(cx);
+    cx.notify();
+  }
+
+  loadTrees(cx) {
+    const repo = this.repo.git, t = this.trees, context = this.context;
+    if (!repo || t.loading) return;
+    t.loading = true;
+    cx.spawn(async (cx) => {
+      try {
+        const list = await git.readWorktrees(repo, (path) => git.gitAt(exec, path, repo.on));
+        if (this.current(context)) { t.list = list; t.error = null; }
+      } catch (e) { if (this.current(context)) { t.list = []; t.error = String(e?.message ?? e); } }
+      finally { t.loading = false; cx.notify(); }
+    });
+  }
+
+  /** Go to the space showing a checkout, or open one there: unnamed, so the sidebar nests it under its repo. */
+  openTree(w) {
+    this.menu = false;
+    const s = spaceOf(w.path, this.trees.list ?? [], this.repo.git?.on);
+    if (s) run("space.select", { id: s.id });
+    else run("space.new", { folder: w.path, machine: this.repo.git?.on ?? "" });
+  }
+
+  /** Herdr's worktree dialog: "new" makes one from the repository, "remove" deletes a checkout. */
+  worktreeDialog(action, folder) {
+    if (!folder) return;
+    const space = action === "remove" ? spaceOf(folder, this.trees.list ?? [], this.repo.git?.on) : spaces().find((s) => s.active);
+    openOverlay({ mod: "worktree", kind: "dialog", width: action === "new" ? 460 : 440, height: action === "new" ? 280 : 260, props: { space: space?.id, folder, machine: this.repo.git?.on, action } });
+  }
+
+  /** The worktree list's rows: each checkout, whether it's this one, whether a space shows it, and where it is. */
+  treeRows() {
+    const list = this.trees.list ?? [], on = this.repo.git?.on, root = slash(this.repo.root), userHome = on ? null : slash(home());
+    return list.map((w) => {
+      const path = slash(w.path), here = samePath(path, root, caseless());
+      const shown = userHome && inside(path, userHome, caseless()) ? "~" + path.slice(userHome.length) : path;
+      return { ...w, here, open: !here && Boolean(spaceOf(w.path, list, on)), shown };
+    });
+  }
+
+  // ——— History
 
   setMode(mode, cx) {
     if (this.mode === mode) return;
     this.mode = mode; this.note = null;
-    if (mode === "commits" && !this.commits) this.loadLog(this.context, cx, false);
-    if (mode === "worktrees") this.loadTrees(this.context, cx);
+    if (mode === "history" && (!this.history.commits || this.historyStale())) this.loadHistory(cx, false);
     cx.notify();
   }
 
-  loadLog(context, cx, more) {
-    if (!this.root || this.logLoading) return;
-    const root = this.root, on = this.on, skip = more ? (this.commits?.length ?? 0) : 0;
-    const git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
-    this.logLoading = true;
+  /** History's ↑ marks are the commits ahead of the upstream: a push or fetch since the last read changes them. */
+  historyStale() { return Boolean(this.history.commits) && this.history.unpushed.size !== this.branch.ahead; }
+
+  loadHistory(cx, more) {
+    const repo = this.repo.git, h = this.history, context = this.context;
+    if (!repo || h.loading) return;
+    h.loading = true;
     cx.spawn(async (cx) => {
       try {
-        const r = await git(["log", "-z", `--skip=${skip}`, "-n", String(LOG_PAGE + 1), "--format=%H%x1f%h%x1f%an%x1f%at%x1f%D%x1f%s"]);
+        const [page, unpushed] = await Promise.all([git.readLog(repo, more ? h.commits?.length ?? 0 : 0), more ? h.unpushed : git.readUnpushed(repo)]);
         if (!this.current(context)) return;
-        if (r.code !== 0) { this.commits = []; this.logMore = false; this.logError = /does not have any commits/.test(r.stderr) ? "No commits yet" : (r.stderr || "Cannot read the history").trim(); return; }
-        const list = r.stdout.split("\0").filter((x) => x.trim()).map((rec) => {
-          const [sha, short, author, at, refs, subject] = rec.replace(/^\n+/, "").split("\x1f");
-          return { sha, short, author, at: Number(at), refs, subject };
-        });
-        let up = this.unpushed, head = this.headSha;
-        if (!more) {
-          const u = await git(["rev-list", "@{u}..HEAD"]).catch(() => null);   // no upstream: nothing marked
-          up = new Set(u?.code === 0 ? u.stdout.split("\n").filter(Boolean) : []);
-          head = list[0]?.sha ?? null;
-        }
-        if (!this.current(context)) return;
-        this.unpushed = up; this.headSha = head; this.logError = null; this.logMore = list.length > LOG_PAGE;
-        this.commits = [...(more ? this.commits ?? [] : []), ...list.slice(0, LOG_PAGE)];
-        if (this.sel && !this.commits.some((c) => c.sha === this.sel.sha)) this.closeCommit();
-      } catch (e) { if (this.current(context)) this.logError = String(e); }
-      finally { this.logLoading = false; cx.notify(); }
+        h.commits = [...(more ? h.commits ?? [] : []), ...page.commits];
+        h.more = page.more; h.unpushed = unpushed; h.error = null;
+        if (!more) h.headSha = page.commits[0]?.sha ?? null;
+        if (h.sel && !h.commits.some((c) => c.sha === h.sel.sha)) this.closeCommit();
+      } catch (e) { if (this.current(context)) { h.commits = h.commits ?? []; h.more = false; h.error = String(e?.message ?? e); } }
+      finally { h.loading = false; cx.notify(); }
     });
   }
 
   openCommit(c, cx) {
-    this.sel = c; this.cfiles = null; this.copen = null; this.cv = rowsOf([]); this.note = null;
-    const context = this.context, root = this.root, on = this.on;
-    const git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
+    const h = this.history, repo = this.repo.git, context = this.context;
+    Object.assign(h, { sel: c, files: null, open: null, view: EMPTY_DIFF }); this.note = null;
     cx.spawn(async (cx) => {
       try {
-        const [ns, st] = await Promise.all([
-          git(["show", "--format=", "--name-status", "-z", "--no-renames", ...MERGES, c.sha]),
-          git(["show", "--format=", "--numstat", "-z", "--no-renames", ...MERGES, c.sha]),
-        ]);
-        if (!this.current(context) || this.sel !== c) return;
-        if (ns.code !== 0) throw new Error(ns.stderr);
-        const stats = {};
-        for (const entry of st.stdout.split("\0")) {
-          const [a, d, ...p] = entry.replace(/^\n+/, "").split("\t");
-          if (p.length) stats[p.join("\t")] = { add: Number(a) || 0, del: Number(d) || 0, binary: a === "-" };
-        }
-        const f = ns.stdout.split("\0"), files = [];
-        for (let i = 0; i + 1 < f.length; i += 2) {
-          const k = f[i].replace(/^\n+/, "")[0];
-          if (!k) continue;
-          files.push({ path: f[i + 1], status: k === "D" ? "D" : k === "A" ? "A" : "M", ...(stats[f[i + 1]] ?? { add: 0, del: 0 }) });
-        }
-        this.cfiles = files.slice(0, 1000);
-        if (files.length) await this.pickCommitFile(files[0].path, cx, context);
-      } catch (e) { if (this.current(context)) { this.cfiles = []; this.note = `Cannot read this commit: ${e}`; } }
+        const files = await git.readCommitFiles(repo, c.sha);
+        if (!this.current(context) || h.sel !== c) return;
+        h.files = files;
+        if (files.length) await this.pickCommitFile(files[0].path, cx);
+      } catch (e) { if (this.current(context)) { h.files = []; this.note = `Cannot read this commit: ${e?.message ?? e}`; } }
       finally { cx.notify(); }
     });
     cx.notify();
   }
 
-  async pickCommitFile(path, cx, context = this.context) {
-    const c = this.sel;
+  async pickCommitFile(path, cx) {
+    const h = this.history, c = h.sel, context = this.context;
     if (!c) return;
-    this.copen = path; this.cv = rowsOf([]); cx.notify();
-    const r = await exec("git", [...READ, "show", "--format=", "--no-ext-diff", "--no-textconv", "--no-color", ...MERGES, c.sha, "--", path], { cwd: this.root, on: this.on })
-      .catch((e) => ({ code: -1, stdout: "", stderr: String(e) }));
-    if (!this.current(context) || this.sel !== c || this.copen !== path) return;
-    let lines;
-    if (r.code !== 0) lines = [`Cannot show this diff: ${(r.stderr || "").trim()}`];
-    else {
-      const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
-      lines = first < 0 ? [/^Binary files/m.test(r.stdout) ? "Binary file changed" : "No text diff"] : all.slice(first);
-    }
-    this.cv = rowsOf(lines.slice(0, 1500).map((l) => (l.length > 4000 ? l.slice(0, 4000) + "… (line truncated)" : l)));
+    h.open = path; h.view = EMPTY_DIFF; cx.notify();
+    const lines = await git.readCommitDiff(this.repo.git, c.sha, path);
+    if (this.current(context) && h.sel === c && h.open === path) h.view = diffView(clip(lines));
+    cx.notify();
   }
 
-  // ——— fp: Worktrees tab (not upstream). Reads only; changes go through the shipped worktree dialog.
+  closeCommit() { Object.assign(this.history, { sel: null, files: null, open: null, view: EMPTY_DIFF }); }
 
-  loadTrees(context, cx) {
-    if (!this.root || this.treesLoading) return;
-    const root = this.root, on = this.on;
-    const git = (cwd, args) => exec("git", [...READ, ...args], { cwd, on });
-    this.treesLoading = true;
-    cx.spawn(async (cx) => {
-      try {
-        const r = await git(root, ["worktree", "list", "--porcelain"]);
-        if (!this.current(context)) return;
-        if (r.code !== 0) throw new Error((r.stderr || "git worktree list failed").trim());
-        const list = parseWorktrees(r.stdout);
-        await Promise.all(list.slice(0, 30).map(async (w) => {
-          const [st, ab] = await Promise.all([
-            git(w.path, ["status", "--porcelain"]).catch(() => null),
-            w.branch ? git(w.path, ["rev-list", "--left-right", "--count", "HEAD...@{u}"]).catch(() => null) : null,   // no upstream: no arrows
-          ]);
-          if (st?.code === 0) w.dirty = countLines(st.stdout);
-          if (ab?.code === 0) [w.ahead, w.behind] = ab.stdout.trim().split(/\s+/).map(Number);
-        }));
-        if (!this.current(context)) return;
-        this.trees = list; this.treesError = null;
-      } catch (e) { if (this.current(context)) { this.trees = []; this.treesError = String(e?.message ?? e); } }
-      finally { this.treesLoading = false; cx.notify(); }
-    });
-  }
-
-  openTree(w) {
-    const s = spaceOf(w.path, this.trees ?? [], this.on);
-    if (s) run("space.select", { id: s.id });
-    else run("space.new", { folder: w.path, machine: this.on ?? "" });   // unnamed, so the sidebar nests it under its repo
-  }
-
-  worktreeDialog(action, folder) {
-    if (!folder) return;
-    const space = action === "remove" ? spaceOf(folder, this.trees ?? [], this.on) : spaces().find((s) => s.active);
-    openOverlay({ mod: "worktree", kind: "dialog", width: action === "new" ? 460 : 440, height: action === "new" ? 280 : 260, props: { space: space?.id, folder, machine: this.on, action } });
-  }
-
-  treeRows(t) {
-    const userHome = this.on ? null : slash(home()), root = slash(this.root);
-    const badge = (text, color) => div().flex_none().px(5).rounded(4).border_1().border_color(t.border).text_size(10).text_color(color).child(text);
-    return (this.trees ?? []).map((w, i) => {
-      const path = slash(w.path), here = samePath(path, root), there = !here && spaceOf(w.path, this.trees, this.on);
-      const shown = userHome && inside(path, userHome) ? "~" + path.slice(userHome.length) : path;
-      return h_flex().id(`tree-${i}`).h(44).flex_none().pl(8).pr(4).gap(4).items_center().rounded(7).when(here, (e) => e.bg(t.selected)).when(!here, (e) => e.hover((s) => s.bg(t.hover)))
-        .child(v_flex().id(`tree-open-${i}`).flex_1().min_w(0).h_full().justify_center().cursor_pointer().on_click(() => this.openTree(w))
-          .child(h_flex().gap(6).items_center()
-            .child(div().min_w(0).truncate().when(here, (e) => e.font_semibold()).child(w.branch ?? `detached ${w.head.slice(0, 7)}`))
-            .when(w.main, (e) => e.child(badge("main", t.dim)))
-            .when(Boolean(w.locked), (e) => e.child(badge("locked", t.blocked)))
-            .child(div().flex_1())
-            .when(w.dirty > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.blocked).child(`${w.dirty} changed`)))
-            .when(w.ahead > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi3).child(`↑${w.ahead}`)))
-            .when(w.behind > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi4).child(`↓${w.behind}`)))
-            .when(here, (e) => e.child(div().flex_none().text_size(11).text_color(t.accent).child("here")))
-            .when(Boolean(there), (e) => e.child(div().flex_none().text_size(11).text_color(t.accent).child("open"))))
-          .child(div().truncate().text_size(11).text_color(t.dim).child(shown)))
-        .when(!w.main, (e) => e.child(div().id(`tree-remove-${i}`).size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer().text_color(t.dim)
-          .hover((s) => s.bg(t.raised)).on_click(() => this.worktreeDialog("remove", w.path)).child("×")));
-    });
-  }
-
-  closeCommit() { this.sel = null; this.cfiles = null; this.copen = null; this.cv = rowsOf([]); }
-
-  tab(mode, label, t) {
-    const on = this.mode === mode;
-    return div().id(`changes-tab-${mode}`).px(8).py(3).rounded(6).cursor_pointer().text_color(on ? t.foreground : t.muted)
-      .when(on, (e) => e.bg(t.selected).font_semibold()).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.setMode(mode, cx)).child(label);
-  }
-
-  fileRow(f, selected, onPick, t, id) {
-    const parts = f.path.split("/"), name = parts.pop();
-    return h_flex().id(id).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(selected, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => onPick(cx))
-      .child(div().w(14).text_size(11).text_color(f.status === "A" ? t.ansi2 : f.status === "D" ? t.ansi1 : f.status === "U" ? t.ansi1 : t.blocked).child(f.status))
-      .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().max_w(260).min_w(0).truncate().child(name)))
-      .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${f.add}`))).when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
-  }
-
-  commitRows(t) {
-    const mono = settings().font_family ?? "JetBrains Mono";
-    if (this.sel) {
-      const c = this.sel;
-      return [
-        h_flex().id("commit-back").h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.closeCommit(); cx.notify(); })
-          .child(div().w(14).flex_none().text_color(t.muted).child("←")).child(div().flex_1().min_w(0).truncate().font_semibold().child(c.subject || c.short)),
-        h_flex().h(24).flex_none().px(8).gap(8).items_center().text_size(11).text_color(t.dim)
-          .child(div().w(14).flex_none()).child(div().flex_none().font_family(mono).child(c.short)).child(div().flex_1().min_w(0).truncate().child(`${c.author} · ${dateOf(c.at)}`)),
-        ...(this.cfiles ?? []).map((f) => this.fileRow(f, this.copen === f.path, (cx) => cx.spawn(async (cx) => { await this.pickCommitFile(f.path, cx); cx.notify(); }), t, `cfile-${f.path}`)),
-      ];
-    }
-    const rows = (this.commits ?? []).map((c) => {
-      const up = this.unpushed?.has(c.sha);
-      const ref = (c.refs ?? "").split(", ").filter(Boolean).map((r) => r.replace(/^HEAD -> /, "").replace(/^tag: /, "◆ "))[0];
-      return h_flex().id(`commit-${c.sha}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.openCommit(c, cx))
-        .child(div().w(58).flex_none().font_family(mono).text_size(11).text_color(up ? t.ansi3 : t.dim).child((up ? "↑" : " ") + c.short.slice(0, 7)))
-        .child(div().flex_1().min_w(0).truncate().child(c.subject))
-        .when(Boolean(ref), (e) => e.child(div().max_w(110).flex_none().truncate().px(5).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.accent).child(ref)))
-        .child(div().flex_none().text_size(11).text_color(t.dim).child(ago(c.at)));
-    });
-    if (this.logMore) rows.push(h_flex().id("commits-more").h(28).flex_none().px(8).items_center().justify_center().rounded(7).cursor_pointer().text_size(12).text_color(t.accent)
-      .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.loadLog(this.context, cx, true)).child(this.logLoading ? "Loading…" : "Load more"));
-    return rows;
-  }
+  // ——— Drawing
 
   render(cx) {
-    if (key() !== this.context?.key) this.refresh(cx);
-    const t = theme(), size = settings().font_size, add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
-    const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
-    const commits = this.mode === "commits", trees = this.mode === "worktrees", changes = !commits && !trees;
-    const v = commits ? this.cv : { rows: this.rows, longest: this.longest, gutterChars: this.gutterChars };
-    const listId = commits ? "changes-clist" : "changes-list", diffId = commits ? "changes-cdiff" : "changes-diff";
-    const listRows = trees ? this.treeRows(t) : commits ? this.commitRows(t) : this.files.map((f) => this.fileRow(f, this.open === f.path, (cx) => this.pick(f.path, cx), t, `change-${f.path}`));
-    const count = commits ? (this.sel ? (this.cfiles?.length ?? 0) + 2 : (this.commits?.length ?? 0) + (this.logMore ? 1 : 0)) : this.files.length;
-    const empty = trees
-      ? (this.trees?.length ? null : this.treesError || (this.trees ? "No worktrees" : this.root ? "Loading worktrees…" : this.error || "No folder"))
-      : commits
-      ? (this.sel ? (this.cfiles ? (this.cfiles.length ? null : "No file changes") : "Loading commit…") : (this.commits?.length ? null : this.logError || (this.root ? "Loading commits…" : this.error || "No folder")))
-      : (this.files.length ? null : this.error || (this.loading ? "Loading changes…" : this.root ? "No uncommitted changes" : "No folder"));
-    const hint = trees ? null : commits ? (!this.sel && this.commits?.length ? "Select a commit to see its changes" : null) : (!this.open && this.files.length > 0 ? "Select a file to view its changes" : null);
-    const sAdd = (this.cfiles ?? []).reduce((n, f) => n + f.add, 0), sDel = (this.cfiles ?? []).reduce((n, f) => n + f.del, 0);
-    return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
+    if (!checking() && where() !== this.context?.key) this.refresh(cx);
+    const t = theme(), font = { size: settings().font_size, mono: settings().font_family ?? "JetBrains Mono" };
+    const history = this.mode === "history";
+    const body = history ? this.historyBody(t, font) : this.changesBody(t);
+    return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border)
+      .text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
-        if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
+        if (e.key !== "escape") return;
+        if (this.typing) { this.typing = false; this.handle.focus(); }
+        else if (this.menu) this.menu = false;
+        else return;
+        cx.stop_propagation(); cx.notify();
       })
-      .child(h_flex().h(42).flex_none().px(10).gap(4).items_center().border_b(1).border_color(t.border)
-        .child(this.tab("changes", "Changes", t)).child(this.tab("commits", "Commits", t)).child(this.tab("worktrees", "Worktrees", t))
-        .when(changes, (e) => e.child(div().ml(4).px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} files`)))
-        .when(commits && this.unpushed?.size > 0, (e) => e.child(div().ml(4).px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.ansi3).child(`↑${this.unpushed.size} not pushed`)))
-        .child(div().flex_1())
-        .when(trees && Boolean(this.root), (e) => e.child(div().id("new-worktree").h(24).px(8).flex().items_center().rounded(6).cursor_pointer().text_size(12).text_color(t.accent)
-          .hover((s) => s.bg(t.hover)).on_click(() => this.worktreeDialog("new", this.root)).child("+ New worktree")))
-        .when(changes || (commits && Boolean(this.sel)), (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${commits ? sAdd : add}`)).child(div().text_size(11).text_color(t.ansi1).child(`−${commits ? sDel : del}`))))
-      // overflow_y_scrollbar() wraps the list, so its flex sizing never reached the panel's layout.
-      .child(div().flex_1().min_h(44).when(!trees, (e) => e.max_h(count * 28 + 12)).relative().border_b(1).border_color(t.border)
-        .child(v_flex().id(listId).absolute().inset_0().overflow_y_scroll().p(6).children(listRows).when(Boolean(empty), (e) => e.child(div().p(8).text_color(t.dim).child(empty))))
-        .child(Scrollbar.vertical(listId).absolute().inset_0()))
-      .when(changes && this.limited, el => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
-      .when(!trees, (diff) => diff.child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(size)
-        .child(div().id(`${diffId}-x`).size_full().overflow_x_scrollbar()
-          .child(div().w_full().min_w(Math.max(300, v.longest * charWidth(size) + this.gutter(size, v.gutterChars) + 20)).h_full().child(v_virtual_list(diffId, v.rows.length, rowHeight(size), (i) => String(i),
-            (range) => v.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t, size, v.gutterChars))).size_full())))
-        .child(Scrollbar.vertical(diffId).viewport_from_layout().absolute().inset_0())
-        .when(Boolean(hint), (e) => e.child(div().absolute().top(6).px(12).text_size(11).text_color(t.dim).child(hint)))))
+      .when(Boolean(this.repo.root), (e) => e.child(ui.branchBar({ ...this.branch, headSha: this.repo.headSha },
+        { menu: this.menu, syncing: this.sync?.context === this.context ? this.sync.op : this.sync ? "other" : null }, t,
+        { toggle: (cx) => this.toggleMenu(cx), sync: (op, cx) => this.syncWith(op, cx) })))
+      .when(this.menu, (e) => e.child(ui.worktreeList(this.treeRows(), this.trees.list?.length ? null : this.trees.error || (this.trees.list ? "No worktrees" : "Loading worktrees…"), t, {
+        open: (w, cx) => { this.openTree(w); cx.notify(); },
+        remove: (w) => this.worktreeDialog("remove", w.path),
+        create: (cx) => { this.menu = false; this.worktreeDialog("new", this.repo.root); cx.notify(); },
+      })))
+      .child(ui.tabBar(this.mode, body.files, t, (mode, cx) => this.setMode(mode, cx)))
+      .child(ui.listBox(history ? "changes-clist" : "changes-list", body.rows, body.rows.length, body.empty, t))
+      .when(!history && this.repo.limited, (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
+      .child(ui.diffPane(history ? "changes-cdiff" : "changes-diff", body.view, body.hint, font, t))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
-      .when(changes, (e) => e.child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
-        .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
-        .child(div().id("commit").h(32).px(14).flex().items_center().rounded(8).bg(enabled ? t.solid : t.raised).text_color(enabled ? t.solid_foreground : t.dim).text_size(12).when(enabled, (e) => e.cursor_pointer()).on_click((_e, cx) => this.commit(cx)).child(this.busy ? "Committing…" : "Commit"))));
+      .when(!history && Boolean(this.repo.root), (e) => e.child(ui.commitBox(this.input, {
+        typing: this.typing, count: this.repo.files.length, busy: this.committing,
+        ready: Boolean(this.message.trim() && this.repo.root && !this.committing && !this.loading),
+      }, t, (cx) => this.commit(cx))));
+  }
+
+  changesBody(t) {
+    const { files, error, root } = this.repo, open = this.changes.open;
+    return {
+      files,
+      rows: files.map((f) => ui.fileRow(f, open === f.path, (cx) => this.pick(f.path, cx), t, `change-${f.path}`)),
+      empty: files.length ? null : error || (this.loading ? "Loading changes…" : root ? "No uncommitted changes" : "No folder"),
+      view: this.changes.view,
+      hint: !open && files.length ? "Select a file to view its changes" : null,
+    };
+  }
+
+  historyBody(t, { mono }) {
+    const h = this.history, on = {
+      open: (c, cx) => this.openCommit(c, cx), more: (cx) => this.loadHistory(cx, true),
+      back: (cx) => { this.closeCommit(); cx.notify(); }, file: (path, cx) => this.pickCommitFile(path, cx),
+    };
+    if (h.sel) return {
+      files: h.files ?? [],
+      rows: ui.commitDetail(h.sel, h.files ?? [], h.open, mono, t, on),
+      empty: h.files ? (h.files.length ? null : "No file changes") : "Loading commit…",
+      view: h.view, hint: null,
+    };
+    return {
+      files: [],
+      rows: ui.commitRows(h.commits ?? [], { unpushed: h.unpushed, more: h.more, loading: h.loading, mono }, t, on),
+      empty: h.commits?.length ? null : h.error || (this.repo.root ? "Loading commits…" : this.repo.error || "No folder"),
+      view: EMPTY_DIFF,
+      hint: h.commits?.length ? "Select a commit to see its changes" : null,
+    };
   }
 }

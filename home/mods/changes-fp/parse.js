@@ -1,0 +1,163 @@
+// Parsing git's output and shaping diffs for display. Plain functions with no imports, so tests run them in Node.
+
+/** Lines in a text, not counting a final newline. */
+export const countLines = (text) => (text ? text.split("\n").length - Number(text.endsWith("\n")) : 0);
+
+const WIDE = /[\p{Ideographic}\p{Emoji_Presentation}\p{Extended_Pictographic}\u{1100}-\u{115f}\u{2e80}-\u{a4cf}\u{ac00}-\u{d7a3}\u{fe10}-\u{fe19}\u{fe30}-\u{fe6f}\u{ff01}-\u{ff60}\u{ffe0}-\u{ffe6}]/gu;
+
+/** Columns a line takes: spacing marks keep room, wide glyphs take two. */
+export function displayColumns(text) {
+  let columns = text.length;
+  for (const glyph of text.match(WIDE) ?? []) if (glyph.length === 1) columns++;
+  return columns;
+}
+
+/** Text draws a tab as nothing: pad each to the next 4-column stop. */
+export const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - ((s.length - 1) % 4) + 4));
+
+const MAX_LINES = 1500, MAX_LINE = 4000;
+
+/** A diff cut to what the panel draws: 1,500 lines of at most 4,000 characters. */
+export const clip = (lines) => lines.slice(0, MAX_LINES).map((l) => (l.length > MAX_LINE ? l.slice(0, MAX_LINE) + "… (line truncated)" : l));
+
+/** A diff from its first hunk on, or null when it has none (binary, mode only). */
+export function hunks(text) {
+  const all = text.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
+  return first < 0 ? null : all.slice(first);
+}
+
+/** Number each diff line once, so a frame only draws the rows on screen. */
+export function diffRows(lines) {
+  let old = 0, next = 0;
+  return lines.map((line) => {
+    const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
+    if (match) { old = +match[1]; next = +match[2]; return { kind: "@", text: line }; }
+    const kind = line[0], text = untab(line.slice(1)) || " ";
+    if (kind === "-") return { kind, number: old++, text };
+    if (kind === "+") return { kind, number: next++, text };
+    if (kind === " ") { old++; return { kind, number: next++, text }; }
+    return { kind: "", text: line };
+  });
+}
+
+/** A diff ready to draw: its rows, widest line and line-number width. */
+export function diffView(lines) {
+  const rows = diffRows(lines);
+  return {
+    rows,
+    longest: Math.max(0, ...rows.map((r) => displayColumns(r.text))),
+    gutterChars: Math.max(4, String(Math.max(0, ...rows.map((r) => r.number ?? 0))).length),
+  };
+}
+
+export const EMPTY_DIFF = diffView([]);
+
+const MAX_FILES = 1000;
+
+/** `git status --porcelain=v1 -z` as files: path, status (A, M, D, or U for a conflict), fresh (untracked). */
+export function parseStatus(out) {
+  const entries = out.split("\0").filter(Boolean);
+  const files = entries.slice(0, MAX_FILES).map((entry) => {
+    const xy = entry.slice(0, 2), fresh = xy === "??";
+    const conflict = xy.includes("U") || xy === "AA" || xy === "DD";
+    const status = conflict ? "U" : xy.includes("D") ? "D" : fresh || xy.includes("A") ? "A" : "M";
+    return { path: entry.slice(3), status, fresh, add: 0, del: 0 };
+  });
+  return { files, limited: entries.length > MAX_FILES };
+}
+
+/** `git diff --numstat -z` outputs as lines added and removed per path, summed. */
+export function parseNumstat(outputs) {
+  const stats = {};
+  for (const out of outputs) {
+    for (const entry of out.split("\0")) {
+      const [a, d, ...parts] = entry.replace(/^\n+/, "").split("\t");
+      if (!parts.length) continue;
+      const path = parts.join("\t"), was = stats[path] ?? { add: 0, del: 0 };
+      stats[path] = { add: was.add + (Number(a) || 0), del: was.del + (Number(d) || 0), binary: a === "-" };
+    }
+  }
+  return stats;
+}
+
+/** `git show --name-status -z` as files with their status letter. */
+export function parseNameStatus(out) {
+  const f = out.split("\0"), files = [];
+  for (let i = 0; i + 1 < f.length; i += 2) {
+    const k = f[i].replace(/^\n+/, "")[0];
+    if (k) files.push({ path: f[i + 1], status: k === "D" ? "D" : k === "A" ? "A" : "M", add: 0, del: 0 });
+  }
+  return files.slice(0, MAX_FILES);
+}
+
+/** The `git log` format parseLog reads: fields split by unit separators. */
+export const LOG_FORMAT = "--format=%H%x1f%h%x1f%an%x1f%at%x1f%D%x1f%s";
+
+/** `git log -z` in LOG_FORMAT as commits. */
+export function parseLog(out) {
+  return out.split("\0").filter((x) => x.trim()).map((rec) => {
+    const [sha, short, author, at, refs, subject] = rec.replace(/^\n+/, "").split("\x1f");
+    return { sha, short, author, at: Number(at), refs, subject };
+  });
+}
+
+/** The first branch or tag a commit carries, as a short label. */
+export const refLabel = (refs) => (refs ?? "").split(", ").filter(Boolean).map((r) => r.replace(/^HEAD -> /, "").replace(/^tag: /, "◆ "))[0];
+
+/** `git rev-list --left-right --count HEAD...@{u}` as [ahead, behind]. */
+export const parseCounts = (out) => out.trim().split(/\s+/).map(Number);
+
+/** `git worktree list --porcelain`: the main checkout first; bare and missing ones dropped. */
+export function parseWorktrees(out) {
+  return out.split(/\n\n+/).map((block, i) => {
+    const lines = block.split("\n"), field = (k) => lines.find((l) => l === k || l.startsWith(k + " "));
+    const bare = Boolean(field("bare")), lock = field("locked");
+    return {
+      path: field("worktree")?.slice(9), head: field("HEAD")?.slice(5) ?? "", branch: field("branch")?.slice(7).replace(/^refs\/heads\//, "") ?? null,
+      main: i === 0 && !bare, bare, prunable: Boolean(field("prunable")), locked: lock === undefined ? null : lock.slice(7) || "locked",
+    };
+  }).filter((w) => w.path && !w.bare && !w.prunable);
+}
+
+/** The reason in a failed push or pull, at most three lines: git prints hints and progress around it. */
+export function gitError(text) {
+  const lines = String(text ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !/^hint:/i.test(l));
+  const reasons = lines.filter((l) => /^(fatal|error)\b|^!/i.test(l) || /rejected|denied|not possible/i.test(l));
+  return (reasons.length ? reasons : lines).slice(0, 3).join("\n") || "git gave no reason";
+}
+
+/**
+ * The git arguments for fetch, pull or push on a branch, or null when it can't. Pull only fast-forwards,
+ * so it never makes a merge commit; push on a branch with no upstream publishes it to the remote.
+ */
+export function syncArgs(op, { branch, upstream, remote, hasHead }) {
+  if (!remote) return null;
+  if (op === "fetch") return upstream ? ["fetch"] : ["fetch", remote];
+  if (!branch || !hasHead) return null;
+  if (op === "pull") return upstream ? ["pull", "--ff-only"] : null;
+  if (op === "push") return upstream ? ["push"] : ["push", "-u", remote, "HEAD"];
+  return null;
+}
+
+/** How long ago a Unix time was: now, 5m, 3h, 2d, or the date past a month. */
+export function ago(at, now = Date.now() / 1000) {
+  const s = Math.max(0, now - at);
+  if (s < 60) return "now";
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  if (s < 2592000) return `${Math.floor(s / 86400)}d`;
+  return new Date(at * 1000).toISOString().slice(0, 10);
+}
+
+/** "1 file", "3 files". */
+export const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/** A path with forward slashes and no trailing one. */
+export const slash = (p) => (p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+
+/** Whether two paths are the same. Windows compares without case: git says C:/x where a pane says c:\x. */
+export const samePath = (a, b, caseless) => (caseless ? a.toLowerCase() === b.toLowerCase() : a === b);
+
+/** Whether path p is dir or inside it. */
+export const inside = (p, dir, caseless) =>
+  samePath(p, dir, caseless) || (p.length > dir.length && samePath(p.slice(0, dir.length + 1), dir + "/", caseless));
