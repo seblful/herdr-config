@@ -19,6 +19,9 @@ const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", 
 const PER_FOLDER = 500, TOTAL = 5000;
 const EDIT_MAX = 400000;   // fp: longer files are shown cut short, so they stay read-only
 const lf = (s) => s?.replace(/\r\n/g, "\n");   // fp: the editor may not keep CRLF; compare without it
+// fp: a folder takes its most urgent change: conflict > deleted > modified > added.
+const RANK = { A: 1, M: 2, D: 3, U: 4 };
+const markColor = (mark, t) => (mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked);
 
 async function directory(path, on) {
   const windowsDirectory = async () => {
@@ -49,7 +52,7 @@ export default class Files extends View {
   init(_props, cx) {
     this.saved = new Map();
     this.drafts = new Map(); this.edit = null;   // fp: unsaved text by absolute path; the open file's edit state
-    this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
+    this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {}; this.dirMarks = {};
     this.mermaid = new Mermaid(); this.mermaid.prune();   // fp
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
@@ -86,7 +89,7 @@ export default class Files extends View {
       if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file });
       const saved = this.saved.get(next);
       this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
-      this.pending = new Set(); this.marks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
+      this.pending = new Set(); this.marks = {}; this.dirMarks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
       this.loading = false;
       if (saved?.file) this.show(saved.file, cx);
     }
@@ -100,18 +103,27 @@ export default class Files extends View {
           if (!this.current(context)) return;
           await this.loadFolder(path, context);
         }
-        const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
-        const marks = {};
+        // fp: marks are keyed by the path under the shown folder. Git writes C:/x where the pane says C:\x,
+        // so absolute paths never matched on Windows.
+        const top = await exec("git", ["rev-parse", "--show-prefix"], { cwd, on }).catch(() => null);
+        const marks = {}, dirMarks = {}, prefix = top?.code === 0 ? top.stdout.trim() : "";
         if (top?.code === 0) {
           // Writes nothing under .git (index lock, fsmonitor cookie): the folder watch would refresh again.
           const status = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], { cwd, on }).catch(() => null);
           if (status?.code === 0) for (const entry of status.stdout.split("\0").filter(Boolean).slice(0, TOTAL)) {
             const xy = entry.slice(0, 2);
-            marks[`${top.stdout.trim()}/${entry.slice(3)}`] = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
+            const path = entry.slice(3).replace(/\/$/, "");
+            if (!path.startsWith(prefix)) continue;   // outside the shown folder
+            const rel = path.slice(prefix.length), mark = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
+            marks[rel] = mark;
+            for (let i = rel.lastIndexOf("/"); i > 0; i = rel.lastIndexOf("/", i - 1)) {
+              const dir = rel.slice(0, i);
+              if ((RANK[dirMarks[dir]] ?? 0) < RANK[mark]) dirMarks[dir] = mark;
+            }
           }
         }
         if (!this.current(context)) return;
-        this.marks = marks; this.error = null; this.watch(cwd, cx);
+        this.marks = marks; this.dirMarks = dirMarks; this.error = null; this.watch(cwd, cx);
         await this.recheck(cx);   // fp
       } catch (e) { if (this.current(context)) this.error = String(e); }
       finally { if (this.context === context) this.loading = false; cx.notify(); }
@@ -173,16 +185,16 @@ export default class Files extends View {
     if (out.length >= TOTAL || depth > 40) return out;
     for (const entry of this.entries.get(prefix) ?? []) {
       if (out.length >= TOTAL) break;
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = (entry.dir ? this.dirMarks : this.marks)[path];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
         .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
         .when(!entry.dir && this.drafts.has(`${this.root}/${path}`), el => el.tooltip("Unsaved changes"))
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.reveal(path, entry.dir); })   // fp: in the system file manager
         .child(entry.dir ? svg(`mods/files-fp/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(svg(`mods/files-fp/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
-        .child(div().flex_1().min_w(0).truncate().child(entry.name))
+        .child(div().flex_1().min_w(0).truncate().when(Boolean(mark), el => el.text_color(markColor(mark, t))).child(entry.name))   // fp: changed in git
         .when(!entry.dir && this.drafts.has(`${this.root}/${path}`), el => el.child(div().text_size(11).text_color(t.blocked).child("●")))   // fp: unsaved
-        .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark))));
+        .when(Boolean(mark), el => el.child(div().text_size(entry.dir ? 8 : 11).text_color(markColor(mark, t)).child(entry.dir ? "●" : mark))));
       if (entry.dir && open) this.rows(path, depth + 1, out, t);
     }
     return out;
