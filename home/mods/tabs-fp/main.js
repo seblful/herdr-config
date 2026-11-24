@@ -2,7 +2,7 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 // file-preview's clone of Herdr's tabs (0.1.12): the same bar plus a Preview button that opens
 // file-preview in the side panel, the stack child "file-preview" of the main-fp layout.
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings, keys } from "herdr";
+import { spaces, panes, focused, exec, run, openOverlay, theme, window, shared, layout, settings, keys } from "herdr";
 
 const PREVIEW = "file-preview";
 const PANEL_W = 368;   // the side panel's width in main-fp.json: where a tab never resized starts
@@ -20,6 +20,16 @@ function previewTip(mac) {
   return "Open or close the file preview" + (k ? ` (${shortcut(k.keys, mac)})` : "");
 }
 
+// fp: the folder the Git panel shows (the focused pane's, as in changes-fp), for the Git button's count.
+function location() {
+  const space = spaces().find(s => s.active), f = focused();
+  const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
+  const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
+  return { cwd: pane?.cwd || f?.cwd || space?.folder, on };
+}
+// Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie).
+const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
+
 function find(node, id) {
   if (node?.id === id) return node;
   for (const child of node?.children ?? []) {
@@ -30,10 +40,29 @@ function find(node, id) {
 }
 
 export default class Tabs extends View {
-  init() {
+  init(_props, cx) {
     this.pressed = null;
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
     this.widths = JSON.parse(localStorage.getItem("widths") ?? "{}");
+    this.dirty = null; this.dirtyKey = null;   // fp: uncommitted files in the focused folder's repo (null: not a repo)
+    cx.timer.every(4000, cx => this.countChanges(cx));
+  }
+
+  /** fp: count uncommitted files (staged, unstaged, untracked) for the Git button; at most one git at a time. */
+  countChanges(cx) {
+    const where = location(), k = JSON.stringify(where);
+    if (this.counting || !where.cwd) { if (!where.cwd && this.dirty !== null) { this.dirty = null; cx.notify(); } return; }
+    this.counting = true;
+    cx.spawn(async cx => {
+      let n = null;
+      try {
+        const r = await exec("git", [...READ, "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], { cwd: where.cwd, on: where.on, timeout: 15000 });
+        if (r.code === 0) n = r.stdout.split("\0").filter(Boolean).length;
+      } catch {}
+      this.counting = false;
+      if (k !== JSON.stringify(location())) return this.countChanges(cx);   // the focus moved meanwhile
+      if (n !== this.dirty || k !== this.dirtyKey) { this.dirty = n; this.dirtyKey = k; cx.notify(); }
+    });
   }
 
   // The side panel's width is remembered per tab (the layout keeps one for the whole window):
@@ -98,8 +127,9 @@ export default class Tabs extends View {
     localStorage.setItem("panels", JSON.stringify(this.panels));
   }
 
-  render() {
+  render(cx) {
     const t = theme();
+    if (this.dirtyKey !== JSON.stringify(location()) && !this.counting) this.countChanges(cx);   // fp: the focus moved
     const space = spaces().find(p => p.active);
     const shown = space?.tabs ?? [];
     const stop = (_e, cx) => cx.stop_propagation();
@@ -133,7 +163,7 @@ export default class Tabs extends View {
     const enabled = shared("workspace.panels") ?? ["files", "changes"];
     this.syncPanel(space, panel, body, enabled);
     this.syncWidth(shown.find(c => c.active), panel);
-    const panelButton = (id, label, icon, tip) => {
+    const panelButton = (id, label, icon, tip, badge) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
         .text_size(12).bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted).when(Boolean(tip), el => el.tooltip(tip))
@@ -144,7 +174,8 @@ export default class Tabs extends View {
             run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" });
             if (id === PREVIEW) run(`${PREVIEW}.focus-side`);   // file-preview takes the keyboard
           }
-        }).child(svg(icon).size(14)).child(label);
+        }).child(svg(icon).size(14)).child(label)
+        .when(Boolean(badge), el => el.child(div().h(16).min_w(16).px(4).flex().items_center().justify_center().rounded(8).bg(t.blocked).text_color(t.background).text_size(10).font_semibold().child(badge)));
     };
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
@@ -152,7 +183,7 @@ export default class Tabs extends View {
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().children(shown.map(item)))
       .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
       .when(enabled.includes("files"), el => el.child(panelButton("files", "Files", "mods/files/file.svg")))
-      .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Git", "mods/changes/changes.svg")))
+      .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Git", "mods/changes/changes.svg", this.dirty ? `${this.dirty} uncommitted ${this.dirty === 1 ? "change" : "changes"}` : null, this.dirty ? (this.dirty > 99 ? "99+" : String(this.dirty)) : null)))
       .when(Boolean(find(root, PREVIEW)), el => el.child(panelButton(PREVIEW, "Preview", "mods/file-preview/icons/file-md.svg", previewTip(w?.platform === "macos"))))
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs-fp/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs-fp/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
