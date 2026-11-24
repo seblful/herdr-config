@@ -1,0 +1,10 @@
+{
+  "name": "file-preview-pele",
+  "private": true,
+  "type": "module",
+  "description": "Windows fit (not upstream): Mermaid -> PNG with Pele + resvg, no browser",
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "pele": "^1.13.0"
+  }
+}

@@ -1,0 +1,12 @@
+# Backups that deploy, capture and add keep of files they replace
+.backups/
+
+# Written by Herdr or npm inside mod folders; never tracked
+node_modules/
+.cache/
+gpui-kit.d.ts
+jsconfig.json
+
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,16 @@
+{
+  "name": "herdr-config",
+  "private": true,
+  "description": "My Herdr app mods, layouts and keys, synced between machines",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "status": "node scripts/herdr.mjs status",
+    "deploy": "node scripts/herdr.mjs deploy",
+    "capture": "node scripts/herdr.mjs capture",
+    "add": "node scripts/herdr.mjs add",
+    "check": "node scripts/herdr.mjs check"
+  }
+}
