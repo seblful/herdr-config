@@ -95,12 +95,12 @@ export default class Files extends View {
       const saved = this.saved.get(next);
       this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
       this.pending = new Set(); this.marks = {}; this.dirMarks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
-      this.loading = false;
+      this.loading = null;
       if (saved?.file) this.show(saved.file, cx);
     }
-    if (!cwd || this.loading) return;
-    const context = this.context;
-    this.loading = true;
+    // fp: a load older than a minute is taken as hung (a read that never answers), so it can't freeze the panel.
+    if (!cwd || (this.loading && Date.now() - this.loading.at < 60000)) return;
+    const context = this.context, run = this.loading = { at: Date.now() };
     this.limited = false;
     cx.spawn(async cx => {
       try {
@@ -127,11 +127,11 @@ export default class Files extends View {
             }
           }
         }
-        if (!this.current(context)) return;
+        if (!this.current(context) || this.loading !== run) return;
         this.marks = marks; this.dirMarks = dirMarks; this.error = null; this.watch(cwd, cx);
         await this.recheck(cx);   // fp
       } catch (e) { if (this.current(context)) this.error = String(e); }
-      finally { if (this.context === context) this.loading = false; cx.notify(); }
+      finally { if (this.loading === run) this.loading = null; cx.notify(); }
     });
   }
 

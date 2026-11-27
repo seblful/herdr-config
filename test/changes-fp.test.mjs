@@ -3,8 +3,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   parseStatus, parseNumstat, parseNameStatus, parseLog, parseCounts, parseWorktrees, refLabel,
-  gitError, syncArgs, diffRows, diffView, hunks, clip, countLines, untab, ago, plural, inside, samePath,
+  gitError, syncArgs, diffRows, diffView, hunks, clip, countLines, untab, ago, plural, inside, samePath, statusCount, within, Gate,
 } from "../home/mods/changes-fp/parse.js";
+import { gitAt, commitAll, sync, readWorktrees, READ_MS } from "../home/mods/changes-fp/git.js";
+
+/** An exec that records each call and answers from `reply(cmd, args)`: a result, or a thrown error. */
+function fakeExec(reply = () => ({ code: 0, stdout: "", stderr: "" })) {
+  const calls = [];
+  const exec = async (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { code: 0, stdout: "", stderr: "", ...reply(cmd, args) }; };
+  return { exec, calls };
+}
+const gitArgs = (calls) => calls.map((c) => (c.cmd === "git" ? c.args : c.args.slice(3)).join(" "));
 
 test("status: letters for modified, added, untracked, deleted and conflicted files", () => {
   const out = [" M src/a.js", "A  b.js", "?? new.txt", " D gone.js", "UU both.js", "AA twice.js"].join("\0") + "\0";
@@ -125,4 +134,100 @@ test("paths: same and inside, without case on Windows", () => {
   assert.ok(inside("C:/r/sub/file", "c:/r", true));
   assert.ok(inside("/r", "/r", false));
   assert.ok(!inside("/rx", "/r", false), "a sibling with the same prefix");
+});
+
+test("status count: every entry, untracked files included", () => {
+  assert.equal(statusCount(" M a.js\0?? dir/new.txt\0?? dir/other.txt\0"), 3);
+  assert.equal(statusCount(""), 0);
+});
+
+test("within: the work's answer, or a timeout once the sleep ends first", async () => {
+  assert.equal(await within(Promise.resolve(7), 1000, () => new Promise(() => {}), "Reading"), 7);
+  await assert.rejects(within(new Promise(() => {}), 20000, () => Promise.resolve(), "Reading a file"), /Reading a file took over 20s/);
+});
+
+test("gate: one load at a time, but a hung one stops counting after the limit", () => {
+  const gate = new Gate(60000);
+  const first = gate.enter(0);
+  assert.ok(first && gate.busy);
+  assert.equal(gate.enter(59999), null, "a young load holds the gate");
+  const second = gate.enter(60000);
+  assert.ok(second, "a load past the limit is given up");
+  assert.ok(!gate.holds(first) && gate.holds(second), "the given-up load may no longer show its results");
+  gate.leave(first);
+  assert.ok(gate.busy, "the old load ending late doesn't free the gate");
+  const forced = gate.enter(60001, true);
+  assert.ok(forced && gate.holds(forced), "Refresh starts over at once");
+  gate.leave(forced);
+  assert.ok(!gate.busy);
+});
+
+test("git reads have a time limit", async () => {
+  const { exec, calls } = fakeExec();
+  await gitAt(exec, "/r", null).read(["status"]);
+  assert.equal(calls[0].opts.timeout, READ_MS);
+  assert.ok(calls[0].args.includes("--no-optional-locks"));
+});
+
+test("sync: runs through sh with prompts off; push waits for the pre-push hook", async () => {
+  const { exec, calls } = fakeExec();
+  const git = gitAt(exec, "/r", null, "C:/Program Files/Git/bin/sh.exe");
+  const branch = { branch: "main", upstream: "origin/main", remote: "origin", hasHead: true };
+  await sync(git, "fetch", branch);
+  await sync(git, "push", branch);
+  assert.equal(calls[0].cmd, "C:/Program Files/Git/bin/sh.exe");
+  assert.deepEqual(calls[0].args.slice(0, 2), ["-c", 'GIT_TERMINAL_PROMPT=0 exec git "$@"']);
+  assert.deepEqual(gitArgs(calls), ["fetch", "push"]);
+  assert.equal(calls[0].opts.timeout, 120000);
+  assert.equal(calls[1].opts.timeout, 600000);
+});
+
+test("sync: git's reason comes back when it fails", async () => {
+  const { exec } = fakeExec(() => ({ code: 128, stderr: "fatal: could not read Username for 'https://x': terminal prompts disabled\n" }));
+  const branch = { branch: "main", upstream: "origin/main", remote: "origin", hasHead: true };
+  await assert.rejects(sync(gitAt(exec, "/r", null), "pull", branch), /terminal prompts disabled/);
+});
+
+test("commit all: stages, commits, and waits for the pre-commit hook", async () => {
+  const { exec, calls } = fakeExec((_c, args) => (args[0] === "write-tree" ? { stdout: "tree1\n" } : {}));
+  await commitAll(gitAt(exec, "/r", null), "fix: a bug");
+  assert.deepEqual(gitArgs(calls), ["write-tree", "add -A", "commit -m fix: a bug"]);
+  assert.equal(calls[2].opts.timeout, 600000);
+});
+
+test("commit all: a refused commit puts back what was staged before", async () => {
+  const { exec, calls } = fakeExec((_c, args) =>
+    args[0] === "write-tree" ? { stdout: "tree1\n" } : args[0] === "commit" ? { code: 1, stderr: "ruff....Failed\n" } : {});
+  await assert.rejects(commitAll(gitAt(exec, "/r", null), "wip"), /ruff\.\.\.\.Failed/);
+  assert.deepEqual(gitArgs(calls), ["write-tree", "add -A", "commit -m wip", "read-tree tree1"]);
+});
+
+test("commit all: a timeout leaves the staging alone, since git may still finish", async () => {
+  const { exec, calls } = fakeExec((_c, args) => {
+    if (args[0] === "commit") throw new Error("timed out");
+    return args[0] === "write-tree" ? { stdout: "tree1\n" } : {};
+  });
+  await assert.rejects(commitAll(gitAt(exec, "/r", null), "wip"), /timed out/);
+  assert.ok(!gitArgs(calls).some((a) => a.startsWith("read-tree")));
+});
+
+test("commit all: with conflicts there is no tree to put back", async () => {
+  const { exec, calls } = fakeExec((_c, args) =>
+    args[0] === "write-tree" ? { code: 128, stderr: "error: unmerged files" } : args[0] === "commit" ? { code: 1, stderr: "nope" } : {});
+  await assert.rejects(commitAll(gitAt(exec, "/r", null), "wip"), /nope/);
+  assert.ok(!gitArgs(calls).some((a) => a.startsWith("read-tree")));
+});
+
+test("worktrees: changed files counted as the Changes tab counts them", async () => {
+  const { exec } = fakeExec((_c, args) => {
+    if (args.includes("worktree")) return { stdout: "worktree /r\nHEAD aaa\nbranch refs/heads/main\n" };
+    if (args.includes("status")) {
+      assert.ok(args.includes("--untracked-files=all") && args.includes("-z"));
+      return { stdout: "?? dir/a\0?? dir/b\0 M c\0" };
+    }
+    return { stdout: "1\t0\n" };
+  });
+  const [w] = await readWorktrees(gitAt(exec, "/r", null), (p) => gitAt(exec, p, null));
+  assert.equal(w.dirty, 3);
+  assert.deepEqual([w.ahead, w.behind], [1, 0]);
 });

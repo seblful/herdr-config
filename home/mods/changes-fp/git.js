@@ -1,6 +1,6 @@
 // Every git command the Git panel runs. No herdr import: the panel hands in its exec, so this runs anywhere.
 import {
-  parseStatus, parseNumstat, parseNameStatus, parseLog, LOG_FORMAT, parseCounts, parseWorktrees, gitError, hunks, countLines, syncArgs,
+  parseStatus, parseNumstat, parseNameStatus, parseLog, LOG_FORMAT, parseCounts, parseWorktrees, gitError, hunks, countLines, syncArgs, statusCount,
 } from "./parse.js";
 
 // Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie): the folder watch would
@@ -9,16 +9,25 @@ export const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", 
 const MERGES = ["--diff-merges=first-parent"];   // a merge commit diffs against its first parent
 const PLAIN = ["--no-ext-diff", "--no-textconv", "--no-color"];
 const NUMSTAT = ["--numstat", "-z", "--no-renames"];
+export const READ_MS = 20000;
 const NETWORK_MS = 120000;
+// Commit and push run the repository's hooks (lint, tests, a build), which can take minutes: Herdr's cap.
+const HOOKS_MS = 600000;
+// Run through sh so git fails at once instead of waiting on a password prompt nobody can see.
+const NO_PROMPT = 'GIT_TERMINAL_PROMPT=0 exec git "$@"';
 const COUNTED_NEW = 20;   // new files whose lines count toward the summary; past that, reading them all costs too much
 export const LOG_PAGE = 100;
 
-/** Git in one folder on one machine: read() never writes under .git, write() may. */
-export function gitAt(exec, cwd, on) {
+/**
+ * Git in one folder on one machine: read() never writes under .git, write() may, network() reaches a remote
+ * and never prompts. `shell` is the sh that runs network(): Git for Windows' own on a Windows machine.
+ */
+export function gitAt(exec, cwd, on, shell = "sh") {
   return {
-    cwd, on,
-    read: (args) => exec("git", [...READ, ...args], { cwd, on }),
+    cwd, on, shell,
+    read: (args) => exec("git", [...READ, ...args], { cwd, on, timeout: READ_MS }),
     write: (args, timeout) => exec("git", args, { cwd, on, timeout }),
+    network: (args, timeout) => exec(shell, ["-c", NO_PROMPT, "git", ...args], { cwd, on, timeout }),
   };
 }
 
@@ -126,27 +135,31 @@ export async function readWorktrees(git, gitIn) {
   await Promise.all(list.slice(0, 30).map(async (w) => {
     const at = gitIn(w.path);
     const [status, counts] = await Promise.all([
-      at.read(["status", "--porcelain"]).catch(() => null),
+      at.read(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]).catch(() => null),
       w.branch ? at.read(["rev-list", "--left-right", "--count", "HEAD...@{u}"]).catch(() => null) : null,
     ]);
-    if (status?.code === 0) w.dirty = countLines(status.stdout);
+    if (status?.code === 0) w.dirty = statusCount(status.stdout);   // counted as the Changes tab counts
     if (counts?.code === 0) [w.ahead, w.behind] = parseCounts(counts.stdout);
   }));
   return list;
 }
 
-/** Stage every change, then commit it. */
+/** Stage every change, then commit it; when the commit fails (a hook said no), the staging is put back. */
 export async function commitAll(git, message) {
-  for (const args of [["add", "-A"], ["commit", "-m", message]]) {
-    const r = await git.write(args);
-    if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
-  }
+  const before = await git.write(["write-tree"]).catch(() => null);   // fails with conflicts: nothing to put back then
+  const added = await git.write(["add", "-A"]);
+  if (added.code !== 0) throw new Error((added.stderr || added.stdout).trim());
+  // A timeout throws here and leaves the staging alone: git may still be running and finish the commit.
+  const r = await git.write(["commit", "-m", message], HOOKS_MS);
+  if (r.code === 0) return;
+  if (before?.code === 0) await git.write(["read-tree", before.stdout.trim()]).catch(() => null);
+  throw new Error((r.stderr || r.stdout).trim() || "git commit failed");
 }
 
 /** Fetch, pull or push the branch; throws with git's reason when that fails. */
 export async function sync(git, op, branch) {
   const args = syncArgs(op, branch);
   if (!args) throw new Error(`This branch has nothing to ${op}`);
-  const r = await git.write(args, NETWORK_MS);
+  const r = await git.network(args, op === "push" ? HOOKS_MS : NETWORK_MS);
   if (r.code !== 0) throw new Error(gitError(r.stderr || r.stdout));
 }

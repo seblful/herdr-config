@@ -104,6 +104,9 @@ export function parseLog(out) {
 /** The first branch or tag a commit carries, as a short label. */
 export const refLabel = (refs) => (refs ?? "").split(", ").filter(Boolean).map((r) => r.replace(/^HEAD -> /, "").replace(/^tag: /, "◆ "))[0];
 
+/** Entries in `git status --porcelain=v1 -z`. */
+export const statusCount = (out) => out.split("\0").filter(Boolean).length;
+
 /** `git rev-list --left-right --count HEAD...@{u}` as [ahead, behind]. */
 export const parseCounts = (out) => out.trim().split(/\s+/).map(Number);
 
@@ -147,6 +150,29 @@ export function ago(at, now = Date.now() / 1000) {
   if (s < 86400) return `${Math.floor(s / 3600)}h`;
   if (s < 2592000) return `${Math.floor(s / 86400)}d`;
   return new Date(at * 1000).toISOString().slice(0, 10);
+}
+
+/** Work that rejects once `sleep(ms)` resolves first: a read that never answers must not hold the panel. */
+export function within(work, ms, sleep, what) {
+  return Promise.race([work, sleep(ms).then(() => { throw new Error(`${what} took over ${Math.round(ms / 1000)}s`); })]);
+}
+
+/**
+ * One load at a time, where a load older than `limit` ms no longer counts: a task that never ends (a hung
+ * read, a cancelled await) would otherwise block every later load and freeze the panel on old data.
+ */
+export class Gate {
+  constructor(limit) { this.limit = limit; this.run = null; }
+  /** A token for a new load, or null while a younger one runs; `force` starts one anyway. */
+  enter(now = Date.now(), force = false) {
+    if (this.run && !force && now - this.run.at < this.limit) return null;
+    return (this.run = { at: now });
+  }
+  /** Whether `run` is still the load in charge, so its results may be shown. */
+  holds(run) { return this.run === run; }
+  leave(run) { if (this.run === run) this.run = null; }
+  reset() { this.run = null; }
+  get busy() { return this.run !== null; }
 }
 
 /** "1 file", "3 files". */

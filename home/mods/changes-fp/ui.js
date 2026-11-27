@@ -27,7 +27,7 @@ function scrolling(box, id, rows, empty, t) {
 }
 
 /** The branch, its distance from the upstream, and the Fetch, Pull and Push it allows. */
-export function branchBar(b, { menu, syncing }, t, on) {
+export function branchBar(b, { menu, syncing, loading, readAt }, t, on) {
   const name = b.branch ?? (b.headSha ? `detached ${b.headSha.slice(0, 7)}` : "no commits");
   const publishable = Boolean(b.branch && b.remote && b.headSha);
   const action = (op, label, tip) => div().id(`sync-${op}`).h(24).px(8).flex().flex_none().items_center().rounded(6).border_1().border_color(t.border).text_size(12)
@@ -42,6 +42,9 @@ export function branchBar(b, { menu, syncing }, t, on) {
     .when(b.ahead > 0, (e) => e.child(small(`↑${b.ahead}`, t.ansi3)))
     .when(b.behind > 0, (e) => e.child(small(`↓${b.behind}`, t.ansi4)))
     .child(div().flex_1())
+    .child(div().id("refresh").size(24).flex().flex_none().items_center().justify_center().rounded(6).cursor_pointer().text_color(loading ? t.dim : t.muted)
+      .hover((s) => s.bg(t.hover)).tooltip(loading ? "Reading the folder…" : readAt ? `Refresh · last read ${new Date(readAt).toLocaleTimeString()}` : "Refresh")
+      .on_click((_e, cx) => on.refresh(cx)).child("↻"))
     .when(Boolean(b.remote), (e) => e.child(action("fetch", "Fetch", `Fetch from ${b.upstream?.split("/")[0] ?? b.remote}`)))
     .when(Boolean(b.upstream) && b.behind > 0, (e) => e.child(action("pull", "Pull", `Fast-forward ${plural(b.behind, "commit")} from ${b.upstream}; never merges`)))
     .when(publishable && (!b.upstream || b.ahead > 0), (e) => e.child(b.upstream
@@ -56,7 +59,8 @@ export function worktreeList(trees, empty, t, on) {
     .child(v_flex().id(`tree-open-${i}`).flex_1().min_w(0).h_full().justify_center().cursor_pointer().on_click((_e, cx) => on.open(w, cx))
       .child(h_flex().gap(6).items_center()
         .child(div().min_w(0).truncate().when(w.here, (e) => e.font_semibold()).child(w.branch ?? `detached ${w.head.slice(0, 7)}`))
-        .when(w.main, (e) => e.child(badge("main", t.dim, t)))
+        // "main" would read as a branch: this is the repository's own folder, the one the others were made from.
+        .when(w.main, (e) => e.child(badge("original folder", t.dim, t)))
         .when(Boolean(w.locked), (e) => e.child(badge("locked", t.blocked, t)))
         .child(div().flex_1())
         .when(w.dirty > 0, (e) => e.child(small(`${w.dirty} changed`, t.blocked)))
@@ -67,11 +71,30 @@ export function worktreeList(trees, empty, t, on) {
       .child(div().truncate().text_size(11).text_color(t.dim).child(w.shown)))
     .when(!w.main, (e) => e.child(div().id(`tree-remove-${i}`).size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer().text_color(t.dim)
       .tooltip("Remove this worktree").hover((s) => s.bg(t.raised)).on_click(() => on.remove(w)).child("×"))));
+  // With only the repository's own folder there is nothing to switch to: say what a worktree is for.
+  const alone = trees.length === 1 && trees[0].main;
   return v_flex().flex_none().border_b(1).border_color(t.border)
-    .child(div().px(14).pt(8).text_size(11).text_color(t.dim).child("Worktrees"))
+    .child(div().px(14).pt(8).text_size(11).text_color(t.dim).child("Worktrees: folders of this repository, each with its own branch"))
     .child(scrolling(div().h(Math.min(Math.max(rows.length, 1), 5) * TREE_ROW + 12).flex_none(), "tree-list", rows, empty, t))
+    .when(alone, (e) => e.child(div().px(14).pb(4).text_size(11).text_color(t.dim)
+      .child("This is the only one. A new worktree checks out another branch in a second folder, so you can work on both at once.")))
     .child(div().id("new-worktree").h(30).mx(6).mb(6).px(8).flex().items_center().rounded(7).cursor_pointer().text_size(12).text_color(t.accent)
       .hover((s) => s.bg(t.hover)).on_click((_e, cx) => on.create(cx)).child("+ New worktree"));
+}
+
+/** Why the last read failed, and since when the panel shows older information. */
+export function banner(error, readAt, t) {
+  const since = readAt ? ` Showing what was read at ${new Date(readAt).toLocaleTimeString()}.` : "";
+  return div().flex_none().px(12).py(6).border_b(1).border_color(t.border).bg(t.ansi1 + "14").text_size(11).text_color(t.ansi1)
+    .child(`Could not refresh: ${error.split("\n")[0]}.${since}`);
+}
+
+/** The latest commits, shown under a clean working tree; picking one opens it in History. */
+export function recentCommits(commits, unpushed, mono, t, onOpen) {
+  const rows = commitRows(commits, { unpushed, more: false, loading: false, mono }, t, { open: onOpen });
+  return v_flex().flex_1().min_h(0)
+    .child(div().px(14).pt(8).pb(2).text_size(11).text_color(t.dim).child("Recent commits"))
+    .child(scrolling(div().flex_1().min_h(0), "changes-recent", rows, null, t));
 }
 
 /** Changes and History, and a summary of the files the open tab shows. */
@@ -152,6 +175,7 @@ export function commitBox(input, { typing, count, ready, busy }, t, onCommit) {
     .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(typing ? t.accent : t.border).cursor_text()
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(input).h_full().text_size(12).text_color(t.foreground)))
     .child(div().id("commit").h(32).px(14).flex().flex_none().items_center().rounded(8).bg(ready ? t.solid : t.raised).text_color(ready ? t.solid_foreground : t.dim).text_size(12)
-      .tooltip("Stages every file in the list (git add -A), then commits").when(ready, (e) => e.cursor_pointer()).on_click((_e, cx) => onCommit(cx))
+      .tooltip(count ? "Stages every file in the list (git add -A), then commits; a refused commit restores what was staged before" : "Nothing to commit")
+      .when(ready, (e) => e.cursor_pointer()).on_click((_e, cx) => onCommit(cx))
       .child(busy ? "Committing…" : count ? `Commit all · ${count}` : "Commit"));
 }

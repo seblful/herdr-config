@@ -3,7 +3,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, InputState } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, nextCommand, run, openOverlay, home, window, checking } from "herdr";
-import { EMPTY_DIFF, diffView, clip, slash, inside, samePath } from "./parse.js";
+import { EMPTY_DIFF, diffView, clip, slash, inside, samePath, Gate, within } from "./parse.js";
 import * as git from "./git.js";
 import * as ui from "./ui.js";
 
@@ -16,6 +16,11 @@ function location() {
 }
 const where = () => JSON.stringify(location());
 const caseless = () => window().platform === "windows";
+// Herdr's exec has a minimal PATH without Git's sh on Windows; Git for Windows' sh.exe sets up its own.
+const shell = (on) => (!on && caseless() ? "C:/Program Files/Git/bin/sh.exe" : "sh");
+const gitIn = (path, on) => git.gitAt(exec, path, on, shell(on));
+// Past this a load counts as hung: reads time out at 20s, so a healthy one never gets near it.
+const LOAD_LIMIT_MS = 60000;
 
 /** The space showing a checkout: its first terminal is in it, and the deepest checkout wins. */
 function spaceOf(path, trees, on) {
@@ -45,6 +50,8 @@ export default class Changes extends View {
     this.sync = null;            // { op, context } while a fetch, pull or push runs
     this.committing = false;
     this.note = null;            // the last action's error
+    this.gate = new Gate(LOAD_LIMIT_MS);   // the load running, if any
+    this.readAt = null;          // when the folder was last read in full
     this.message = "";
     this.handle = cx.focus_handle();
     this.input = InputState.new({ placeholder: "Commit message" });
@@ -64,13 +71,14 @@ export default class Changes extends View {
 
   /**
    * "changes-fp.<command>" from keys.json or `herdr-app do`: changes, history (or commits), worktrees (opens or
-   * closes the list), fetch, pull, push, commit:<n>, file:<n>, worktree:<n>, new-worktree, back, more.
+   * closes the list), fetch, pull, push, refresh, commit:<n>, file:<n>, worktree:<n>, new-worktree, back, more.
    */
   command(c, cx) {
     const [name, arg] = (c ?? "").split(":"), n = Number(arg), h = this.history;
     if (name === "changes" || name === "history" || name === "commits") this.setMode(name === "changes" ? "changes" : "history", cx);
     else if (name === "worktrees") this.toggleMenu(cx);
     else if (name === "fetch" || name === "pull" || name === "push") this.syncWith(name, cx);
+    else if (name === "refresh") this.refresh(cx, true);
     else if (name === "worktree" && this.trees.list?.[n]) this.openTree(this.trees.list[n]);
     else if (name === "new-worktree") this.worktreeDialog("new", this.repo.root);
     else if (name === "commit" && h.commits?.[n]) this.openCommit(h.commits[n], cx);
@@ -84,39 +92,44 @@ export default class Changes extends View {
   /** One visit to a folder: what an earlier visit to the same folder read is stale too. */
   current(context) { return this.context === context && where() === context.key; }
 
-  refresh(cx) {
+  /** Read the folder again; `force` (the Refresh button) drops a load still running and starts over. */
+  refresh(cx, force = false) {
     const { cwd, on } = location(), key = JSON.stringify({ cwd, on });
     if (key !== this.context?.key) {
       Object.assign(this, fresh());
-      this.context = { key }; this.menu = false; this.note = null; this.watched = null;
+      this.context = { key }; this.menu = false; this.note = null; this.watched = null; this.readAt = null;
       this.message = ""; this.input.set_value("");
       // A load left behind in another folder (a slow git, a read that never ends) must not hold this one.
-      this.loading = false; this.queued = false;
+      this.gate.reset(); this.queued = false;
     }
     if (!cwd || this.committing) return;
+    const context = this.context, run = this.gate.enter(Date.now(), force);
     // Asked for meanwhile (a fetch or push just ended): it runs as soon as this one ends.
-    if (this.loading) { this.queued = true; return; }
-    const context = this.context;
-    this.loading = true;
+    if (!run) { this.queued = true; return; }
+    const live = () => this.current(context) && this.gate.holds(run);
+    if (force) cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const root = await git.findRoot(git.gitAt(exec, cwd, on));
-        if (!this.current(context)) return;
+        const root = await git.findRoot(gitIn(cwd, on));
+        if (!live()) return;
         if (!root) { Object.assign(this, fresh()); this.repo.error = "Not a git repository"; return; }
-        const repo = git.gitAt(exec, root, on);
-        const readText = (p) => readTextFile(p, { on });
+        const repo = gitIn(root, on);
+        const readText = (p) => within(readTextFile(p, { on }), git.READ_MS, (ms) => cx.sleep(ms), "Reading a file");
         const [changes, branch] = await Promise.all([git.readChanges(repo, readText), git.readBranch(repo)]);
-        if (!this.current(context)) return;
+        if (!live()) return;
         this.repo = { git: repo, root, ...changes, error: null };
         this.branch = branch;
+        this.readAt = Date.now();
         this.watch(root, cx);
-        if (this.mode === "history" && (changes.headSha !== this.history.headSha || this.historyStale())) this.loadHistory(cx, false);
+        // History feeds the History tab, and Changes when nothing is uncommitted.
+        const wantHistory = this.mode === "history" || !changes.files.length;
+        if (wantHistory && (!this.history.commits || changes.headSha !== this.history.headSha || this.historyStale())) this.loadHistory(cx, false);
         if (this.menu) this.loadTrees(cx);
-        await this.showChanges(context);
-      } catch (e) { if (this.current(context)) this.repo.error = String(e?.message ?? e); }
+        await this.showChanges(context, cx);
+      } catch (e) { if (live()) this.repo.error = String(e?.message ?? e); }
       finally {
-        if (this.context === context) this.loading = false;
-        if (this.queued && !this.loading) { this.queued = false; this.refresh(cx); }
+        this.gate.leave(run);
+        if (this.queued && !this.gate.busy) { this.queued = false; this.refresh(cx); }
         cx.notify();
       }
     });
@@ -139,19 +152,20 @@ export default class Changes extends View {
   // ——— Changes
 
   /** Keep the open file's diff current; the first file opens until another is picked or it's closed. */
-  async showChanges(context) {
+  async showChanges(context, cx) {
     const c = this.changes, files = this.repo.files;
     if (c.open && !files.some((f) => f.path === c.open)) { c.open = null; c.view = EMPTY_DIFF; }
     if (!c.open && !c.closed && files.length) c.open = files[0].path;
     if (!c.open) return;
-    try { await this.loadDiff(c.open, context); }
+    try { await this.loadDiff(c.open, context, cx); }
     catch { if (this.current(context)) c.view = diffView(["Cannot preview this diff (too large or unreadable)"]); }
   }
 
-  async loadDiff(path, context) {
+  async loadDiff(path, context, cx) {
     const file = this.repo.files.find((f) => f.path === path), repo = this.repo.git;
     if (!file) return;
-    const { lines, added } = await git.readFileDiff(repo, file, Boolean(this.repo.headSha), (p) => readTextFile(p, { on: repo.on }));
+    const readText = (p) => within(readTextFile(p, { on: repo.on }), git.READ_MS, (ms) => cx.sleep(ms), "Reading the file");
+    const { lines, added } = await git.readFileDiff(repo, file, Boolean(this.repo.headSha), readText);
     if (added !== undefined) file.add = added;
     if (this.current(context) && this.changes.open === path) this.changes.view = diffView(clip(lines));
   }
@@ -160,7 +174,7 @@ export default class Changes extends View {
     const c = this.changes, context = this.context;
     c.open = c.open === path ? null : path; c.closed = !c.open; c.view = EMPTY_DIFF; this.note = null;
     if (c.open) cx.spawn(async (cx) => {
-      try { await this.loadDiff(path, context); }
+      try { await this.loadDiff(path, context, cx); }
       catch (e) { if (this.current(context) && c.open === path) this.note = `Cannot preview this diff (too large or unreadable): ${e?.message ?? e}`; }
       cx.notify();
     });
@@ -169,7 +183,8 @@ export default class Changes extends View {
 
   commit(cx) {
     const repo = this.repo.git, message = this.message.trim(), context = this.context;
-    if (!message || !repo || this.committing || this.loading || context?.key !== where()) return;
+    // Commit all stages with `git add -A`, so a read still running doesn't matter: it needs only a change to commit.
+    if (!message || !repo || !this.repo.files.length || this.committing || context?.key !== where()) return;
     this.committing = true; this.note = null;
     cx.spawn(async (cx) => {
       try {
@@ -207,7 +222,7 @@ export default class Changes extends View {
     t.loading = true;
     cx.spawn(async (cx) => {
       try {
-        const list = await git.readWorktrees(repo, (path) => git.gitAt(exec, path, repo.on));
+        const list = await git.readWorktrees(repo, (path) => gitIn(path, repo.on));
         if (this.current(context)) { t.list = list; t.error = null; }
       } catch (e) { if (this.current(context)) { t.list = []; t.error = String(e?.message ?? e); } }
       finally { t.loading = false; cx.notify(); }
@@ -311,8 +326,10 @@ export default class Changes extends View {
         cx.stop_propagation(); cx.notify();
       })
       .when(Boolean(this.repo.root), (e) => e.child(ui.branchBar({ ...this.branch, headSha: this.repo.headSha },
-        { menu: this.menu, syncing: this.sync?.context === this.context ? this.sync.op : this.sync ? "other" : null }, t,
-        { toggle: (cx) => this.toggleMenu(cx), sync: (op, cx) => this.syncWith(op, cx) })))
+        { menu: this.menu, syncing: this.sync?.context === this.context ? this.sync.op : this.sync ? "other" : null, loading: this.gate.busy, readAt: this.readAt }, t,
+        { toggle: (cx) => this.toggleMenu(cx), sync: (op, cx) => this.syncWith(op, cx), refresh: (cx) => this.refresh(cx, true) })))
+      // A failed read keeps what was read before on screen: say so, or it passes for the current state.
+      .when(Boolean(this.repo.root && this.repo.error), (e) => e.child(ui.banner(this.repo.error, this.readAt, t)))
       .when(this.menu, (e) => e.child(ui.worktreeList(this.treeRows(), this.trees.list?.length ? null : this.trees.error || (this.trees.list ? "No worktrees" : "Loading worktrees…"), t, {
         open: (w, cx) => { this.openTree(w); cx.notify(); },
         remove: (w) => this.worktreeDialog("remove", w.path),
@@ -321,11 +338,13 @@ export default class Changes extends View {
       .child(ui.tabBar(this.mode, body.files, t, (mode, cx) => this.setMode(mode, cx)))
       .child(ui.listBox(history ? "changes-clist" : "changes-list", body.rows, body.rows.length, body.empty, t))
       .when(!history && this.repo.limited, (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
-      .child(ui.diffPane(history ? "changes-cdiff" : "changes-diff", body.view, body.hint, font, t))
+      .child(body.recent
+        ? ui.recentCommits(body.recent, this.history.unpushed, font.mono, t, (c, cx) => { this.setMode("history", cx); this.openCommit(c, cx); })
+        : ui.diffPane(history ? "changes-cdiff" : "changes-diff", body.view, body.hint, font, t))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
       .when(!history && Boolean(this.repo.root), (e) => e.child(ui.commitBox(this.input, {
         typing: this.typing, count: this.repo.files.length, busy: this.committing,
-        ready: Boolean(this.message.trim() && this.repo.root && !this.committing && !this.loading),
+        ready: Boolean(this.message.trim() && this.repo.files.length && !this.committing),
       }, t, (cx) => this.commit(cx))));
   }
 
@@ -334,8 +353,12 @@ export default class Changes extends View {
     return {
       files,
       rows: files.map((f) => ui.fileRow(f, open === f.path, (cx) => this.pick(f.path, cx), t, `change-${f.path}`)),
-      empty: files.length ? null : error || (this.loading ? "Loading changes…" : root ? "No uncommitted changes" : "No folder"),
+      empty: files.length ? null
+        : !root ? error || (this.gate.busy ? "Loading changes…" : "No folder")
+        : error ? "Could not read the changes" : this.readAt ? "No uncommitted changes" : "Loading changes…",
       view: this.changes.view,
+      // Nothing uncommitted: the room the diff would take shows the latest commits instead.
+      recent: !files.length && root && !error && this.history.commits?.length ? this.history.commits.slice(0, 30) : null,
       hint: !open && files.length ? "Select a file to view its changes" : null,
     };
   }

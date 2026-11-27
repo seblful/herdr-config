@@ -52,15 +52,18 @@ export default class Tabs extends View {
   /** fp: count uncommitted files (staged, unstaged, untracked) for the Git button; at most one git at a time. */
   countChanges(cx) {
     const where = location(), k = JSON.stringify(where);
-    if (this.counting || !where.cwd) { if (!where.cwd && this.dirty !== null) { this.dirty = null; cx.notify(); } return; }
-    this.counting = true;
+    // A count older than a minute is taken as hung (git has 15s), so it can't stop the badge for good.
+    const busy = this.counting && Date.now() - this.counting.at < 60000;
+    if (busy || !where.cwd) { if (!where.cwd && this.dirty !== null) { this.dirty = null; cx.notify(); } return; }
+    const run = this.counting = { at: Date.now() };
     cx.spawn(async cx => {
       let n = null;
       try {
         const r = await exec("git", [...READ, "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], { cwd: where.cwd, on: where.on, timeout: 15000 });
         if (r.code === 0) n = r.stdout.split("\0").filter(Boolean).length;
       } catch {}
-      this.counting = false;
+      if (this.counting !== run) return;   // given up on: a newer count runs
+      this.counting = null;
       if (k !== JSON.stringify(location())) return this.countChanges(cx);   // the focus moved meanwhile
       if (n !== this.dirty || k !== this.dirtyKey) { this.dirty = n; this.dirtyKey = k; cx.notify(); }
     });
