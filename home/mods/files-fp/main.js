@@ -1,12 +1,15 @@
 // A lazy file browser for the focused pane's folder, with bounded previews; fp: local text files are editable.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, openOverlay, nextCommand } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, openOverlay, nextCommand, appHome } from "herdr";
 // fp additions (copied from mods/file-preview; they share its .pele renderer and .cache)
 import { segment } from "./markdown.js";
 import { isMarkdown } from "./lang.js";
 import { Mermaid, cacheKey, themeOf } from "./mermaid.js";
 import { isImage, readImage } from "./photo.js";
+import { writeRemote } from "./remote.js";
+import * as fs from "fs/promises";
+import { sh } from "./sh.js";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -19,6 +22,8 @@ const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", 
 const PER_FOLDER = 500, TOTAL = 5000;
 const EDIT_MAX = 400000;   // fp: longer files are shown cut short, so they stay read-only
 const lf = (s) => s?.replace(/\r\n/g, "\n");   // fp: the editor may not keep CRLF; compare without it
+// fp: a draft's key; the same path on two machines is two files.
+const draftKey = (abs, on) => (on ? `${on}:${abs}` : abs);
 // fp: a folder takes its most urgent change: conflict > deleted > modified > added.
 const RANK = { A: 1, M: 2, D: 3, U: 4 };
 const markColor = (mark, t) => (mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked);
@@ -51,7 +56,7 @@ async function directory(path, on) {
 export default class Files extends View {
   init(_props, cx) {
     this.saved = new Map();
-    this.drafts = new Map(); this.edit = null;   // fp: unsaved text by absolute path; the open file's edit state
+    this.drafts = new Map(); this.edit = null;   // fp: unsaved text by draftKey; the open file's edit state
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {}; this.dirMarks = {};
     this.mermaid = new Mermaid(); this.mermaid.prune();   // fp
     this.refresh(cx);
@@ -168,12 +173,12 @@ export default class Files extends View {
         if (this.file !== path || !this.current(context)) return;
         if (text === null) { this.fileError = "This file is no longer available"; return; }
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
-        // fp: local files that fit are editable; a draft left unsaved comes back (its base is what it was edited from).
-        const abs = `${root}/${path}`, draft = this.drafts.get(abs), md = isMarkdown(path);
-        const ed = this.edit = { abs, base: draft?.base ?? text, eol: text.includes("\r\n") ? "\r\n" : "\n", editable: !on && text.length <= EDIT_MAX,
-          readonly: on ? "Files on other machines are read-only" : text.length > EDIT_MAX ? "Too long to edit here" : null,
+        // fp: files that fit are editable, here or on another machine; a draft left unsaved comes back (its base is what it was edited from).
+        const abs = `${root}/${path}`, id = draftKey(abs, on), draft = this.drafts.get(id), md = isMarkdown(path);
+        const ed = this.edit = { abs, on, id, base: draft?.base ?? text, eol: text.includes("\r\n") ? "\r\n" : "\n", editable: text.length <= EDIT_MAX,
+          readonly: text.length > EDIT_MAX ? "Too long to edit here" : null,
           dirty: Boolean(draft), md, mode: md && !draft ? "preview" : "edit", source: draft?.text ?? text, note: null, conflict: false, saving: false };
-        if (draft && !ed.editable) { this.drafts.delete(abs); ed.dirty = false; ed.source = text; ed.base = text; }
+        if (draft && !ed.editable) { this.drafts.delete(id); ed.dirty = false; ed.source = text; ed.base = text; }
         if (md) { this.doc = this.markdown(ed.source, cx); if (ed.mode === "edit") this.code = this.editor(ed, ed.source); return; }
         this.code = this.editor(ed, text.length > EDIT_MAX ? text.slice(0, EDIT_MAX) + "\n… (file truncated)" : ed.source);
       } catch { if (this.file === path && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
@@ -188,12 +193,12 @@ export default class Files extends View {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = (entry.dir ? this.dirMarks : this.marks)[path];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
         .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
-        .when(!entry.dir && this.drafts.has(`${this.root}/${path}`), el => el.tooltip("Unsaved changes"))
+        .when(!entry.dir && this.drafts.has(draftKey(`${this.root}/${path}`, this.on)), el => el.tooltip("Unsaved changes"))
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.reveal(path, entry.dir); })   // fp: in the system file manager
         .child(entry.dir ? svg(`mods/files-fp/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(svg(`mods/files-fp/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
         .child(div().flex_1().min_w(0).truncate().when(Boolean(mark), el => el.text_color(markColor(mark, t))).child(entry.name))   // fp: changed in git
-        .when(!entry.dir && this.drafts.has(`${this.root}/${path}`), el => el.child(div().text_size(11).text_color(t.blocked).child("●")))   // fp: unsaved
+        .when(!entry.dir && this.drafts.has(draftKey(`${this.root}/${path}`, this.on)), el => el.child(div().text_size(11).text_color(t.blocked).child("●")))   // fp: unsaved
         .when(Boolean(mark), el => el.child(div().text_size(entry.dir ? 8 : 11).text_color(markColor(mark, t)).child(entry.dir ? "●" : mark))));
       if (entry.dir && open) this.rows(path, depth + 1, out, t);
     }
@@ -297,8 +302,8 @@ export default class Files extends View {
     else exec("xdg-open", [dir ? abs : abs.replace(/\/[^/]*$/, "")]).catch(() => {});
   }
 
-  // ——— fp: editing. Local text files edit in place; ctrl-s or Save writes them only if the file on
-  // disk is still what they were opened from, else the person picks Overwrite or Reload.
+  // ——— fp: editing. Text files edit in place, here or on another machine; ctrl-s or Save writes them only
+  // if the file on disk is still what they were opened from, else the person picks Overwrite or Reload.
 
   /** A code editor for the open file; typing marks it unsaved. */
   editor(ed, value) {
@@ -322,8 +327,8 @@ export default class Files extends View {
   stash() {
     const ed = this.edit;
     if (!ed?.editable) return;
-    if (ed.dirty) this.drafts.set(ed.abs, { text: this.text(), base: ed.base });
-    else this.drafts.delete(ed.abs);
+    if (ed.dirty) this.drafts.set(ed.id, { text: this.text(), base: ed.base });
+    else this.drafts.delete(ed.id);
   }
 
   /** Write the edits; force: replace whatever is on disk now (after a conflict). */
@@ -335,24 +340,30 @@ export default class Files extends View {
     cx.notify();
     cx.spawn(async cx => {
       try {
-        const expected = force ? await readTextFile(ed.abs) : ed.base;
-        await writeTextFile(ed.abs, text, expected);
+        await this.put(ed, text, force);
         ed.base = text; ed.source = text; ed.conflict = false; ed.note = "Saved";
         ed.dirty = lf(this.edit === ed ? this.text() : text) !== lf(text);   // typing during the write stays unsaved
-        if (!ed.dirty) this.drafts.delete(ed.abs);
+        if (!ed.dirty) this.drafts.delete(ed.id);
       } catch (e) {
-        const now = await readTextFile(ed.abs).catch(() => undefined);
+        const now = await readTextFile(ed.abs, { on: ed.on }).catch(() => undefined);
         if (now !== ed.base) ed.conflict = true;
         else ed.note = `Couldn't save: ${String(e?.message ?? e).slice(0, 120)}`;
       } finally { ed.saving = false; cx.notify(); }
     });
   }
 
+  /** Write the open file's text here or on its machine; force: over whatever is there now. */
+  async put(ed, text, force) {
+    if (!ed.on) return writeTextFile(ed.abs, text, force ? await readTextFile(ed.abs) : ed.base);
+    const io = { exec, read: (p, on) => readTextFile(p, { on }), fs, shell: sh(null), cache: appHome() + "/mods/files-fp/.cache/" };
+    return writeRemote(io, ed.on, ed.abs, text, force ? null : ed.base);
+  }
+
   /** Drop the edits and show the file as it is on disk. */
   revert(cx) {
     const ed = this.edit;
     if (!ed) return;
-    ed.dirty = false; this.drafts.delete(ed.abs);
+    ed.dirty = false; this.drafts.delete(ed.id);
     this.show(this.file, cx); cx.notify();
   }
 
@@ -374,7 +385,7 @@ export default class Files extends View {
   async recheck(cx) {
     const ed = this.edit, path = this.file;
     if (!ed?.editable || ed.dirty || ed.saving) return;
-    const text = await readTextFile(ed.abs).catch(() => undefined);
+    const text = await readTextFile(ed.abs, { on: ed.on }).catch(() => undefined);
     if (text == null || text === ed.base || this.edit !== ed || ed.dirty || text.length > EDIT_MAX) return;
     ed.base = text; ed.source = text; ed.conflict = false; ed.note = null;
     if (ed.md) this.doc = this.markdown(text, cx);
