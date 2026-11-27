@@ -116,14 +116,6 @@ export function banner(error, readAt, t) {
     .child(`Could not refresh: ${error.split("\n")[0]}.${since}`);
 }
 
-/** The latest commits, shown under a clean working tree; picking one opens it in History. */
-export function recentCommits(commits, unpushed, mono, t, onOpen) {
-  const rows = commitRows(commits, { unpushed, more: false, loading: false, mono }, t, { open: onOpen });
-  return v_flex().flex_1().min_h(0)
-    .child(div().px(14).pt(8).pb(2).text_size(11).text_color(t.dim).child("Recent commits"))
-    .child(scrolling(div().flex_1().min_h(0), "changes-recent", rows, null, t));
-}
-
 /** Changes and History, and a summary of the files the open tab shows. */
 export function tabBar(mode, files, t, onMode) {
   const tab = (id, label) => div().id(`changes-tab-${id}`).px(8).py(3).rounded(6).cursor_pointer().text_color(mode === id ? t.foreground : t.muted)

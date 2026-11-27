@@ -134,9 +134,7 @@ export default class Changes extends View {
         this.branch = branch;
         this.readAt = Date.now();
         this.watch(root, cx);
-        // History feeds the History tab, and Changes when nothing is uncommitted.
-        const wantHistory = this.mode === "history" || !changes.files.length;
-        if (wantHistory && (!this.history.commits || changes.headSha !== this.history.headSha || this.historyStale())) this.loadHistory(cx, false);
+        if (this.mode === "history" && (changes.headSha !== this.history.headSha || this.historyStale())) this.loadHistory(cx, false);
         if (this.menu) this.loadMenu(cx);
         await this.showChanges(context, cx);
       } catch (e) { if (live()) this.repo.error = String(e?.message ?? e); }
@@ -415,9 +413,7 @@ export default class Changes extends View {
       .child(ui.tabBar(this.mode, body.files, t, (mode, cx) => this.setMode(mode, cx)))
       .child(ui.listBox(history ? "changes-clist" : "changes-list", body.rows, body.rows.length, body.empty, t))
       .when(!history && this.repo.limited, (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
-      .child(body.recent
-        ? ui.recentCommits(body.recent, this.history.unpushed, font.mono, t, (c, cx) => { this.setMode("history", cx); this.openCommit(c, cx); })
-        : ui.diffPane(history ? "changes-cdiff" : "changes-diff", body.view, body.hint, font, t))
+      .child(ui.diffPane(history ? "changes-cdiff" : "changes-diff", body.view, body.hint, font, t))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
       .when(Boolean(this.notice), (e) => e.child(div().id("notice").px(10).pb(8).text_size(11).text_color(t.muted).cursor_pointer().tooltip("Click to dismiss")
         .on_click((_e, cx) => { this.notice = null; cx.notify(); }).child(this.notice)))
@@ -435,10 +431,7 @@ export default class Changes extends View {
       empty: files.length ? null
         : !root ? error || (this.gate.busy ? "Loading changes…" : "No folder")
         : error ? "Could not read the changes" : this.readAt ? "No uncommitted changes" : "Loading changes…",
-      view: this.changes.view,
-      // Nothing uncommitted: the room the diff would take shows the latest commits instead.
-      recent: !files.length && root && !error && this.history.commits?.length ? this.history.commits.slice(0, 30) : null,
-      hint: !open && files.length ? "Select a file to view its changes" : null,
+      view: this.changes.view,      hint: !open && files.length ? "Select a file to view its changes" : null,
     };
   }
 
