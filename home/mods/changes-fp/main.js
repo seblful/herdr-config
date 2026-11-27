@@ -1,9 +1,9 @@
-// The Git panel: the branch and its worktrees, uncommitted changes with their diffs, and the history.
+// The Git panel: branches and where each is checked out, uncommitted changes with their diffs, and the history.
 // Started as a clone of Herdr's changes mod (0.1.17). git.js runs git, parse.js reads its output, ui.js draws.
 import { View, div } from "gpui-kit";
 import { v_flex, InputState } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, nextCommand, run, openOverlay, home, window, checking } from "herdr";
-import { EMPTY_DIFF, diffView, clip, slash, inside, samePath, Gate, within } from "./parse.js";
+import { EMPTY_DIFF, diffView, clip, slash, inside, Gate, within, branchRows } from "./parse.js";
 import * as git from "./git.js";
 import * as ui from "./ui.js";
 
@@ -39,14 +39,23 @@ const fresh = () => ({
   branch: { branch: null, upstream: null, ahead: 0, behind: 0, remote: null },
   changes: { open: null, closed: false, view: EMPTY_DIFF },
   history: { commits: null, more: false, error: null, unpushed: new Set(), headSha: null, loading: false, sel: null, files: null, open: null, view: EMPTY_DIFF },
-  trees: { list: null, error: null, loading: false },
+  trees: { list: null, branches: null, error: null, loading: false },   // the branch list's data
 });
 
 export default class Changes extends View {
   init(_props, cx) {
     Object.assign(this, fresh());
     this.mode = "changes";       // or "history"
-    this.menu = false;           // the worktree list is open
+    this.menu = false;           // the branch list is open
+    this.switching = null;       // the branch being switched to
+    this.blocked = null;         // a switch uncommitted changes stopped: offered again with a stash
+    this.notice = null;          // the last action's outcome, when it's worth saying
+    this.filter = "";
+    this.filterInput = InputState.new({ placeholder: "Find or create a branch" });
+    this.filterInput.on("change", (_e, cx) => { this.filter = this.filterInput.value(); this.blocked = null; cx.notify(); });
+    this.filterInput.on("submit", (_e, cx) => this.submitFilter(cx));
+    this.filterInput.on("focus", (_e, cx) => { this.finding = true; cx.notify(); });
+    this.filterInput.on("blur", (_e, cx) => { this.finding = false; cx.notify(); });
     this.sync = null;            // { op, context } while a fetch, pull or push runs
     this.committing = false;
     this.note = null;            // the last action's error
@@ -70,13 +79,16 @@ export default class Changes extends View {
   }
 
   /**
-   * "changes-fp.<command>" from keys.json or `herdr-app do`: changes, history (or commits), worktrees (opens or
-   * closes the list), fetch, pull, push, refresh, commit:<n>, file:<n>, worktree:<n>, new-worktree, back, more.
+   * "changes-fp.<command>" from keys.json or `herdr-app do`: changes, history (or commits), branches (or worktrees:
+   * opens or closes the list), switch:<branch>, stash-switch (the offer after a blocked switch), fetch, pull, push, refresh, commit:<n>, file:<n>, worktree:<n>,
+   * new-worktree, back, more.
    */
   command(c, cx) {
     const [name, arg] = (c ?? "").split(":"), n = Number(arg), h = this.history;
     if (name === "changes" || name === "history" || name === "commits") this.setMode(name === "changes" ? "changes" : "history", cx);
-    else if (name === "worktrees") this.toggleMenu(cx);
+    else if (name === "branches" || name === "worktrees") this.toggleMenu(cx);
+    else if (name === "switch" && arg) this.switchBranch(this.trees.branches?.find((b) => b.name === arg) ?? { name: arg }, cx);
+    else if (name === "stash-switch" && this.blocked) this.switchBranch(this.blocked, cx, true);
     else if (name === "fetch" || name === "pull" || name === "push") this.syncWith(name, cx);
     else if (name === "refresh") this.refresh(cx, true);
     else if (name === "worktree" && this.trees.list?.[n]) this.openTree(this.trees.list[n]);
@@ -97,7 +109,8 @@ export default class Changes extends View {
     const { cwd, on } = location(), key = JSON.stringify({ cwd, on });
     if (key !== this.context?.key) {
       Object.assign(this, fresh());
-      this.context = { key }; this.menu = false; this.note = null; this.watched = null; this.readAt = null;
+      this.context = { key }; this.menu = false; this.note = null; this.notice = null; this.blocked = null; this.watched = null; this.readAt = null;
+      this.clearFilter();
       this.message = ""; this.input.set_value("");
       // A load left behind in another folder (a slow git, a read that never ends) must not hold this one.
       this.gate.reset(); this.queued = false;
@@ -124,7 +137,7 @@ export default class Changes extends View {
         // History feeds the History tab, and Changes when nothing is uncommitted.
         const wantHistory = this.mode === "history" || !changes.files.length;
         if (wantHistory && (!this.history.commits || changes.headSha !== this.history.headSha || this.historyStale())) this.loadHistory(cx, false);
-        if (this.menu) this.loadTrees(cx);
+        if (this.menu) this.loadMenu(cx);
         await this.showChanges(context, cx);
       } catch (e) { if (live()) this.repo.error = String(e?.message ?? e); }
       finally {
@@ -212,21 +225,69 @@ export default class Changes extends View {
 
   toggleMenu(cx) {
     this.menu = !this.menu && Boolean(this.repo.root);
-    if (this.menu) this.loadTrees(cx);
+    this.blocked = null;
+    if (this.menu) this.loadMenu(cx);
+    else this.clearFilter();
     cx.notify();
   }
 
-  loadTrees(cx) {
+  clearFilter() { this.filter = ""; this.filterInput.set_value(""); }
+
+  /** The branch list's data: every branch, and the worktrees that say where each one is checked out. */
+  loadMenu(cx) {
     const repo = this.repo.git, t = this.trees, context = this.context;
     if (!repo || t.loading) return;
     t.loading = true;
     cx.spawn(async (cx) => {
       try {
-        const list = await git.readWorktrees(repo, (path) => gitIn(path, repo.on));
-        if (this.current(context)) { t.list = list; t.error = null; }
-      } catch (e) { if (this.current(context)) { t.list = []; t.error = String(e?.message ?? e); } }
+        const [list, branches] = await Promise.all([git.readWorktrees(repo, (path) => gitIn(path, repo.on)), git.readBranches(repo)]);
+        if (this.current(context)) { t.list = list; t.branches = branches; t.error = null; }
+      } catch (e) { if (this.current(context)) { t.list = t.list ?? []; t.branches = t.branches ?? []; t.error = String(e?.message ?? e); } }
       finally { t.loading = false; cx.notify(); }
     });
+  }
+
+  /** A click on a branch: go to the worktree that has it, or switch this folder to it. */
+  pickBranch(row, cx) {
+    if (row.kind === "here") { this.menu = false; this.clearFilter(); }
+    else if (row.kind === "folder") { this.clearFilter(); this.openTree(row); }
+    else this.switchBranch(row, cx);
+    cx.notify();
+  }
+
+  /** Enter in the filter: the branch named exactly, the only one left, or a new one by that name. */
+  submitFilter(cx) {
+    const { rows, create } = this.branchMenu(), wanted = this.filter.trim();
+    const row = rows.find((r) => r.name === wanted) ?? (rows.length === 1 ? rows[0] : null);
+    if (row) this.pickBranch(row, cx);
+    else if (create) this.switchBranch({ name: create, create: true }, cx);
+  }
+
+  /** Switch this folder to a branch (`create` makes it); with `stash`, uncommitted changes are stashed first. */
+  switchBranch(target, cx, stash = false) {
+    const repo = this.repo.git, context = this.context, from = this.branch.branch;
+    if (!repo || this.switching || this.committing || this.sync || context?.key !== where()) return;
+    this.switching = target.name; this.note = null; this.notice = null; this.blocked = null;
+    cx.spawn(async (cx) => {
+      try {
+        const stashed = stash ? await git.stashAndSwitch(repo, target, from) : (await git.switchTo(repo, target), null);
+        if (this.current(context)) {
+          this.menu = false; this.clearFilter();
+          if (stashed) this.notice = `Your changes are stashed as "${stashed}". Back on ${from ?? "that commit"}, git stash pop brings them back.`;
+        }
+      } catch (e) {
+        if (this.current(context)) {
+          this.note = `Could not switch to ${target.name}: ${e?.message ?? e}`;
+          if (e?.blocked && !stash) this.blocked = target;
+        }
+      } finally {
+        this.switching = null;
+        this.refresh(cx, true);
+        if (this.menu) this.loadMenu(cx);
+        cx.notify();
+      }
+    });
+    cx.notify();
   }
 
   /** Go to the space showing a checkout, or open one there: unnamed, so the sidebar nests it under its repo. */
@@ -237,21 +298,30 @@ export default class Changes extends View {
     else run("space.new", { folder: w.path, machine: this.repo.git?.on ?? "" });
   }
 
-  /** Herdr's worktree dialog: "new" makes one from the repository, "remove" deletes a checkout. */
-  worktreeDialog(action, folder) {
+  /**
+   * Herdr's worktree dialog: "new" makes one from the repository, "remove" deletes a checkout. With `branch`,
+   * Herdr makes the worktree on that branch at once.
+   */
+  worktreeDialog(action, folder, branch) {
     if (!folder) return;
     const space = action === "remove" ? spaceOf(folder, this.trees.list ?? [], this.repo.git?.on) : spaces().find((s) => s.active);
-    openOverlay({ mod: "worktree", kind: "dialog", width: action === "new" ? 460 : 440, height: action === "new" ? 280 : 260, props: { space: space?.id, folder, machine: this.repo.git?.on, action } });
+    const props = { space: space?.id, folder, machine: this.repo.git?.on, ...(branch ? { branch } : { action }) };
+    openOverlay({ mod: "worktree", kind: "dialog", width: action === "new" ? 460 : 440, height: action === "new" ? 280 : 260, props });
   }
 
-  /** The worktree list's rows: each checkout, whether it's this one, whether a space shows it, and where it is. */
-  treeRows() {
-    const list = this.trees.list ?? [], on = this.repo.git?.on, root = slash(this.repo.root), userHome = on ? null : slash(home());
-    return list.map((w) => {
-      const path = slash(w.path), here = samePath(path, root, caseless());
-      const shown = userHome && inside(path, userHome, caseless()) ? "~" + path.slice(userHome.length) : path;
-      return { ...w, here, open: !here && Boolean(spaceOf(w.path, list, on)), shown };
-    });
+  /** The branch list as drawn: its rows with their folders shortened, whether a space shows each, and what's offered. */
+  branchMenu() {
+    const t = this.trees, on = this.repo.git?.on, userHome = on ? null : slash(home());
+    const { rows, more, create } = branchRows(t.branches ?? [], t.list ?? [], { root: this.repo.root, caseless: caseless(), filter: this.filter });
+    return {
+      rows: rows.map((r) => {
+        const path = r.path ? slash(r.path) : null;
+        const shown = path && userHome && inside(path, userHome, caseless()) ? "~" + path.slice(userHome.length) : path;
+        return { ...r, shown, open: r.kind === "folder" && Boolean(spaceOf(r.path, t.list ?? [], on)) };
+      }),
+      more, create: t.branches ? create : null,
+      empty: rows.length || create ? null : t.error || (t.branches ? (this.filter.trim() ? "No branch matches" : "No branches yet") : "Loading branches…"),
+    };
   }
 
   // ——— History
@@ -320,8 +390,8 @@ export default class Changes extends View {
       .text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key !== "escape") return;
-        if (this.typing) { this.typing = false; this.handle.focus(); }
-        else if (this.menu) this.menu = false;
+        if (this.typing || this.finding) { this.typing = false; this.finding = false; this.handle.focus(); }
+        else if (this.menu) { this.menu = false; this.clearFilter(); this.blocked = null; }
         else return;
         cx.stop_propagation(); cx.notify();
       })
@@ -330,10 +400,17 @@ export default class Changes extends View {
         { toggle: (cx) => this.toggleMenu(cx), sync: (op, cx) => this.syncWith(op, cx), refresh: (cx) => this.refresh(cx, true) })))
       // A failed read keeps what was read before on screen: say so, or it passes for the current state.
       .when(Boolean(this.repo.root && this.repo.error), (e) => e.child(ui.banner(this.repo.error, this.readAt, t)))
-      .when(this.menu, (e) => e.child(ui.worktreeList(this.treeRows(), this.trees.list?.length ? null : this.trees.error || (this.trees.list ? "No worktrees" : "Loading worktrees…"), t, {
-        open: (w, cx) => { this.openTree(w); cx.notify(); },
-        remove: (w) => this.worktreeDialog("remove", w.path),
-        create: (cx) => { this.menu = false; this.worktreeDialog("new", this.repo.root); cx.notify(); },
+      .when(this.menu, (e) => e.child(ui.branchMenu(this.branchMenu(), {
+        input: this.filterInput, finding: this.finding, switching: this.switching, blocked: this.blocked,
+        current: this.branch.branch ?? (this.repo.headSha ? this.repo.headSha.slice(0, 7) : "this commit"),
+      }, t, {
+        pick: (r, cx) => this.pickBranch(r, cx),
+        create: (name, cx) => this.switchBranch({ name, create: true }, cx),
+        stash: (cx) => { if (this.blocked) this.switchBranch(this.blocked, cx, true); },
+        cancel: (cx) => { this.blocked = null; this.note = null; cx.notify(); },
+        newTree: (r) => this.worktreeDialog("new", this.repo.root, r.name),
+        remove: (r) => this.worktreeDialog("remove", r.path),
+        newWorktree: (cx) => { this.menu = false; this.worktreeDialog("new", this.repo.root); cx.notify(); },
       })))
       .child(ui.tabBar(this.mode, body.files, t, (mode, cx) => this.setMode(mode, cx)))
       .child(ui.listBox(history ? "changes-clist" : "changes-list", body.rows, body.rows.length, body.empty, t))
@@ -342,6 +419,8 @@ export default class Changes extends View {
         ? ui.recentCommits(body.recent, this.history.unpushed, font.mono, t, (c, cx) => { this.setMode("history", cx); this.openCommit(c, cx); })
         : ui.diffPane(history ? "changes-cdiff" : "changes-diff", body.view, body.hint, font, t))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
+      .when(Boolean(this.notice), (e) => e.child(div().id("notice").px(10).pb(8).text_size(11).text_color(t.muted).cursor_pointer().tooltip("Click to dismiss")
+        .on_click((_e, cx) => { this.notice = null; cx.notify(); }).child(this.notice)))
       .when(!history && Boolean(this.repo.root), (e) => e.child(ui.commitBox(this.input, {
         typing: this.typing, count: this.repo.files.length, busy: this.committing,
         ready: Boolean(this.message.trim() && this.repo.files.length && !this.committing),

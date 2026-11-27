@@ -4,8 +4,9 @@ import assert from "node:assert/strict";
 import {
   parseStatus, parseNumstat, parseNameStatus, parseLog, parseCounts, parseWorktrees, refLabel,
   gitError, syncArgs, diffRows, diffView, hunks, clip, countLines, untab, ago, plural, inside, samePath, statusCount, within, Gate,
+  parseBranches, branchRows,
 } from "../home/mods/changes-fp/parse.js";
-import { gitAt, commitAll, sync, readWorktrees, READ_MS } from "../home/mods/changes-fp/git.js";
+import { gitAt, commitAll, sync, readWorktrees, READ_MS, switchTo, stashAndSwitch } from "../home/mods/changes-fp/git.js";
 
 /** An exec that records each call and answers from `reply(cmd, args)`: a result, or a thrown error. */
 function fakeExec(reply = () => ({ code: 0, stdout: "", stderr: "" })) {
@@ -230,4 +231,89 @@ test("worktrees: changed files counted as the Changes tab counts them", async ()
   const [w] = await readWorktrees(gitAt(exec, "/r", null), (p) => gitAt(exec, p, null));
   assert.equal(w.dirty, 3);
   assert.deepEqual([w.ahead, w.behind], [1, 0]);
+});
+
+const ref = (...f) => f.join("\x1f");
+const REFS = [
+  ref("refs/heads/develop", "origin/develop", "", "300", ""),
+  ref("refs/heads/master", "origin/master", "behind 3", "200", ""),
+  ref("refs/heads/feature/login", "", "", "250", ""),
+  ref("refs/heads/old", "origin/old", "gone", "100", ""),
+  ref("refs/remotes/origin/HEAD", "", "", "300", "refs/remotes/origin/develop"),
+  ref("refs/remotes/origin/develop", "", "", "300", ""),
+  ref("refs/remotes/origin/master", "", "", "210", ""),
+  ref("refs/remotes/origin/fix-x", "", "", "400", ""),
+  ref("refs/remotes/origin", "", "", "1", ""),
+].join("\n") + "\n";
+
+test("branches: local first then remote, newest first; origin/HEAD dropped; ahead, behind and gone read", () => {
+  const list = parseBranches(REFS);
+  assert.deepEqual(list.map((b) => b.name), ["develop", "feature/login", "master", "old", "origin/fix-x", "origin/develop", "origin/master"]);
+  const master = list.find((b) => b.name === "master");
+  assert.deepEqual([master.remote, master.upstream, master.ahead, master.behind, master.gone], [false, "origin/master", 0, 3, false]);
+  assert.equal(list.find((b) => b.name === "old").gone, true);
+  assert.equal(list.find((b) => b.name === "origin/fix-x").remote, true);
+});
+
+test("branch rows: here first, then other folders and branches, then remote ones nobody tracks", () => {
+  const trees = [
+    { path: "C:/r", branch: "develop", main: true, head: "a", dirty: 2 },
+    { path: "C:/wt/login", branch: "feature/login", main: false, head: "b", dirty: 0, locked: null },
+    { path: "C:/wt/probe", branch: null, main: false, head: "c1234567890", dirty: 0 },
+  ];
+  const { rows, create } = branchRows(parseBranches(REFS), trees, { root: "c:\\r", caseless: true });
+  assert.deepEqual(rows.map((r) => [r.name, r.kind]), [
+    ["develop", "here"], ["feature/login", "folder"], ["master", "local"], ["old", "local"], ["detached c123456", "folder"], ["origin/fix-x", "remote"],
+  ]);
+  assert.equal(rows[0].dirty, 2);
+  assert.equal(rows[1].path, "C:/wt/login");
+  assert.equal(create, null);
+});
+
+test("branch rows: the filter narrows them and offers a new branch by a name not taken", () => {
+  const branches = parseBranches(REFS), trees = [{ path: "/r", branch: "develop", main: true, head: "a" }];
+  const found = branchRows(branches, trees, { root: "/r", caseless: false, filter: "MAS" });
+  assert.deepEqual(found.rows.map((r) => r.name), ["master"]);
+  assert.equal(found.create, "MAS");
+  assert.equal(branchRows(branches, trees, { root: "/r", caseless: false, filter: "master" }).create, null, "taken");
+  assert.equal(branchRows(branches, trees, { root: "/r", caseless: false, filter: "two words" }).create, null, "not a branch name");
+  assert.equal(branchRows(branches, trees, { root: "/r", caseless: false, filter: "  " }).create, null);
+});
+
+test("switch: a local branch, a remote one tracked, a new one", async () => {
+  const { exec, calls } = fakeExec();
+  const git = gitAt(exec, "/r", null);
+  await switchTo(git, { name: "master" });
+  await switchTo(git, { name: "origin/fix-x", remote: true });
+  await switchTo(git, { name: "spike", create: true });
+  assert.deepEqual(gitArgs(calls), ["switch master", "switch --track origin/fix-x", "switch -c spike"]);
+});
+
+test("switch: refused for uncommitted changes says so, so the panel can offer a stash", async () => {
+  const stderr = "error: Your local changes to the following files would be overwritten by checkout:\n\ta.js\nPlease commit your changes or stash them before you switch branches.\nAborting\n";
+  const { exec } = fakeExec(() => ({ code: 1, stderr }));
+  const e = await switchTo(gitAt(exec, "/r", null), { name: "master" }).catch((e) => e);
+  assert.equal(e.blocked, true);
+  assert.equal(e.message, "uncommitted changes to a.js would be overwritten");
+  const other = await switchTo(gitAt(fakeExec(() => ({ code: 128, stderr: "fatal: invalid reference: nope\n" })).exec, "/r", null), { name: "nope" }).catch((e) => e);
+  assert.equal(other.blocked, false);
+});
+
+test("stash and switch: stashes new files too, and names the stash", async () => {
+  const { exec, calls } = fakeExec((_c, args) => (args[0] === "stash" ? { stdout: "Saved working directory and index state On develop: herdr\n" } : {}));
+  const label = await stashAndSwitch(gitAt(exec, "/r", null), { name: "master" }, "develop");
+  assert.equal(label, "herdr: switching from develop to master");
+  assert.deepEqual(gitArgs(calls), ["stash push --include-untracked -m herdr: switching from develop to master", "switch master"]);
+});
+
+test("stash and switch: a failed switch brings the changes back", async () => {
+  const { exec, calls } = fakeExec((_c, args) => (args[0] === "switch" ? { code: 128, stderr: "fatal: nope\n" } : { stdout: "Saved\n" }));
+  await assert.rejects(stashAndSwitch(gitAt(exec, "/r", null), { name: "master" }, "develop"), /nope/);
+  assert.deepEqual(gitArgs(calls).at(-1), "stash pop");
+});
+
+test("stash and switch: with nothing stashed, a failed switch pops nothing (an older stash would come back)", async () => {
+  const { exec, calls } = fakeExec((_c, args) => (args[0] === "switch" ? { code: 128, stderr: "fatal: nope\n" } : { stdout: "No local changes to save\n" }));
+  await assert.rejects(stashAndSwitch(gitAt(exec, "/r", null), { name: "master" }, "develop"), /nope/);
+  assert.ok(!gitArgs(calls).includes("stash pop"));
 });

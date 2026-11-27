@@ -1,6 +1,7 @@
 // Every git command the Git panel runs. No herdr import: the panel hands in its exec, so this runs anywhere.
 import {
   parseStatus, parseNumstat, parseNameStatus, parseLog, LOG_FORMAT, parseCounts, parseWorktrees, gitError, hunks, countLines, syncArgs, statusCount,
+  parseBranches, BRANCH_FORMAT,
 } from "./parse.js";
 
 // Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie): the folder watch would
@@ -142,6 +143,44 @@ export async function readWorktrees(git, gitIn) {
     if (counts?.code === 0) [w.ahead, w.behind] = parseCounts(counts.stdout);
   }));
   return list;
+}
+
+/** Local and remote branches with their upstream, distance from it and last commit time. */
+export async function readBranches(git) {
+  return parseBranches(stdout(await git.read(["for-each-ref", BRANCH_FORMAT, "refs/heads", "refs/remotes"])));
+}
+
+const SWITCH_MS = 60000;
+// Git's words when uncommitted changes stand in the way of a checkout: the cue to offer stashing them.
+const BLOCKED = /would be overwritten|commit your changes or stash them|untracked working tree files/i;
+
+/**
+ * Switch this folder to a branch: `create` makes it from what is checked out, a remote one gets a local branch
+ * that tracks it. Fails with git's reason; `blocked` on the error says uncommitted changes were in the way.
+ */
+export async function switchTo(git, { name, remote = false, create = false }) {
+  const r = await git.write(create ? ["switch", "-c", name] : remote ? ["switch", "--track", name] : ["switch", name], SWITCH_MS);
+  if (r.code !== 0) {
+    const text = r.stderr || r.stdout, blocked = BLOCKED.test(text);
+    // Git lists the files in the way on tab-indented lines, which gitError leaves out: name them.
+    const files = text.split(/\r?\n/).filter((l) => l.startsWith("\t")).map((l) => l.trim());
+    const message = blocked && files.length
+      ? `uncommitted changes to ${files.slice(0, 3).join(", ")}${files.length > 3 ? ` and ${files.length - 3} more` : ""} would be overwritten`
+      : gitError(text);
+    throw Object.assign(new Error(message), { blocked });
+  }
+}
+
+/** Stash every uncommitted change (new files too), then switch; when the switch fails the changes come back. */
+export async function stashAndSwitch(git, target, from) {
+  const label = `herdr: switching from ${from ?? "a detached HEAD"} to ${target.name}`;
+  const stash = await git.write(["stash", "push", "--include-untracked", "-m", label], SWITCH_MS);
+  if (stash.code !== 0) throw new Error(gitError(stash.stderr || stash.stdout));
+  // Nothing stashed: popping now would bring back an older, unrelated stash.
+  const saved = !/no local changes to save/i.test(stash.stdout + stash.stderr);
+  try { await switchTo(git, target); }
+  catch (e) { if (saved) await git.write(["stash", "pop"], SWITCH_MS).catch(() => null); throw e; }
+  return saved ? label : null;
 }
 
 /** Stage every change, then commit it; when the commit fails (a hook said no), the staging is put back. */

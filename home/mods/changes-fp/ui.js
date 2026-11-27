@@ -4,7 +4,7 @@ import { v_flex, h_flex, Input, Scrollbar, v_virtual_list } from "gpui-base";
 import { ago, plural, refLabel } from "./parse.js";
 
 export const ROW = 28;        // a file or commit row
-export const TREE_ROW = 44;   // a worktree row: branch, then its path
+export const BRANCH_ROW = 40; // a branch row: its name, then where it is checked out
 const STATUS = { A: "ansi2", D: "ansi1", U: "ansi1", M: "blocked" };
 
 // The diff was laid out for 11px text: 20px rows, 7px characters.
@@ -35,7 +35,7 @@ export function branchBar(b, { menu, syncing, loading, readAt }, t, on) {
     .on_click((_e, cx) => on.sync(op, cx)).child(syncing === op ? `${label}ing…` : label);
   return h_flex().h(38).flex_none().px(8).gap(6).items_center().border_b(1).border_color(t.border)
     .child(h_flex().id("branch").min_w(72).h(26).px(6).gap(6).items_center().rounded(6).cursor_pointer().when(menu, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
-      .tooltip(b.upstream ? `Tracks ${b.upstream}. Click for worktrees` : "Click for worktrees").on_click((_e, cx) => on.toggle(cx))
+      .tooltip(b.upstream ? `Tracks ${b.upstream}. Click to switch branch` : "Click to switch branch").on_click((_e, cx) => on.toggle(cx))
       .child(svg("mods/changes-fp/branch.svg").size(14).flex_none().text_color(t.muted))
       .child(div().min_w(0).truncate().font_semibold().child(name))
       .child(svg(`mods/changes-fp/chevron-${menu ? "up" : "down"}.svg`).size(12).flex_none().text_color(t.dim)))
@@ -52,34 +52,61 @@ export function branchBar(b, { menu, syncing, loading, readAt }, t, on) {
       : action("push", "Publish", `Publish ${b.branch} to ${b.remote}`)));
 }
 
-/** The repository's checkouts under the branch bar: open one as a space, remove one, or make a new one. */
-export function worktreeList(trees, empty, t, on) {
-  const rows = trees.map((w, i) => h_flex().id(`tree-${i}`).h(TREE_ROW).flex_none().pl(8).pr(4).gap(4).items_center().rounded(7)
-    .when(w.here, (e) => e.bg(t.selected)).when(!w.here, (e) => e.hover((s) => s.bg(t.hover)))
-    .child(v_flex().id(`tree-open-${i}`).flex_1().min_w(0).h_full().justify_center().cursor_pointer().on_click((_e, cx) => on.open(w, cx))
+const pill = (id, label, onClick, t, strong = false) => div().id(id).h(24).px(8).flex().flex_none().items_center().rounded(6).border_1().border_color(t.border)
+  .text_size(12).cursor_pointer().text_color(strong ? t.accent : t.foreground).hover((s) => s.bg(t.hover)).on_click((_e, cx) => onClick(cx)).child(label);
+
+/** A branch: where it is checked out, how far it is from its upstream, and what a click on it does. */
+function branchRow(r, i, switching, t, on) {
+  const what = r.kind === "here" ? "Checked out in this folder"
+    : r.kind === "folder" ? `Checked out in ${r.shown} · click to go there`
+    : r.kind === "remote" ? `Only on ${r.name.split("/")[0]} · click to check it out here`
+    : "Click to switch this folder to it";
+  const tag = switching === r.name ? small("switching…", t.accent) : r.kind === "here" ? small("here", t.accent)
+    : r.open ? small("open", t.accent) : r.at ? small(ago(r.at), t.dim) : null;
+  return h_flex().id(`branch-${i}`).h(BRANCH_ROW).flex_none().pl(8).pr(4).gap(4).items_center().rounded(7)
+    .when(r.kind === "here", (e) => e.bg(t.selected)).when(r.kind !== "here", (e) => e.hover((s) => s.bg(t.hover)))
+    .child(v_flex().id(`branch-pick-${i}`).flex_1().min_w(0).h_full().justify_center().cursor_pointer().on_click((_e, cx) => on.pick(r, cx))
       .child(h_flex().gap(6).items_center()
-        .child(div().min_w(0).truncate().when(w.here, (e) => e.font_semibold()).child(w.branch ?? `detached ${w.head.slice(0, 7)}`))
-        // "main" would read as a branch: this is the repository's own folder, the one the others were made from.
-        .when(w.main, (e) => e.child(badge("original folder", t.dim, t)))
-        .when(Boolean(w.locked), (e) => e.child(badge("locked", t.blocked, t)))
+        .child(div().min_w(0).truncate().text_color(r.kind === "remote" ? t.muted : t.foreground).when(r.kind === "here", (e) => e.font_semibold()).child(r.name))
+        .when(Boolean(r.locked), (e) => e.child(badge("locked", t.blocked, t)))
+        .when(Boolean(r.gone), (e) => e.child(badge("upstream gone", t.dim, t)))
         .child(div().flex_1())
-        .when(w.dirty > 0, (e) => e.child(small(`${w.dirty} changed`, t.blocked)))
-        .when(w.ahead > 0, (e) => e.child(small(`↑${w.ahead}`, t.ansi3)))
-        .when(w.behind > 0, (e) => e.child(small(`↓${w.behind}`, t.ansi4)))
-        .when(w.here, (e) => e.child(small("here", t.accent)))
-        .when(w.open, (e) => e.child(small("open", t.accent))))
-      .child(div().truncate().text_size(11).text_color(t.dim).child(w.shown)))
-    .when(!w.main, (e) => e.child(div().id(`tree-remove-${i}`).size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer().text_color(t.dim)
-      .tooltip("Remove this worktree").hover((s) => s.bg(t.raised)).on_click(() => on.remove(w)).child("×"))));
-  // With only the repository's own folder there is nothing to switch to: say what a worktree is for.
-  const alone = trees.length === 1 && trees[0].main;
+        .when(r.dirty > 0, (e) => e.child(small(`${r.dirty} changed`, t.blocked)))
+        .when(r.ahead > 0, (e) => e.child(small(`↑${r.ahead}`, t.ansi3)))
+        .when(r.behind > 0, (e) => e.child(small(`↓${r.behind}`, t.ansi4)))
+        .when(Boolean(tag), (e) => e.child(tag)))
+      .child(div().truncate().text_size(11).text_color(t.dim).child(what)))
+    .when(r.kind === "local", (e) => e.child(div().id(`branch-tree-${i}`).size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+      .text_color(t.dim).tooltip("Open in a new worktree: a second folder on this branch, beside this one").hover((s) => s.bg(t.raised))
+      .on_click(() => on.newTree(r)).child("+")))
+    .when(r.kind === "folder" && !r.main, (e) => e.child(div().id(`branch-remove-${i}`).size(22).flex_none().flex().items_center().justify_center().rounded(5)
+      .cursor_pointer().text_color(t.dim).tooltip("Remove this worktree (its folder; the branch stays)").hover((s) => s.bg(t.raised))
+      .on_click(() => on.remove(r)).child("×")));
+}
+
+/**
+ * Under the branch bar: find or create a branch, then every branch with where it is checked out. A click
+ * switches this folder to a branch, or goes to the worktree that has it; uncommitted changes in the way
+ * get an offer to stash them and switch.
+ */
+export function branchMenu(menu, { input, finding, switching, blocked, current }, t, on) {
+  const rows = menu.rows.map((r, i) => branchRow(r, i, switching, t, on));
+  if (menu.create) rows.push(h_flex().id("branch-create").h(BRANCH_ROW).flex_none().px(8).items_center().rounded(7).cursor_pointer().text_color(t.accent)
+    .hover((s) => s.bg(t.hover)).on_click((_e, cx) => on.create(menu.create, cx))
+    .child(div().min_w(0).truncate().child(switching === menu.create ? `Creating ${menu.create}…` : `+ Create branch "${menu.create}" from ${current}`)));
+  if (menu.more) rows.push(div().px(8).py(4).text_size(11).text_color(t.dim).child("Showing the first 200 branches: type to narrow them down"));
   return v_flex().flex_none().border_b(1).border_color(t.border)
-    .child(div().px(14).pt(8).text_size(11).text_color(t.dim).child("Worktrees: folders of this repository, each with its own branch"))
-    .child(scrolling(div().h(Math.min(Math.max(rows.length, 1), 5) * TREE_ROW + 12).flex_none(), "tree-list", rows, empty, t))
-    .when(alone, (e) => e.child(div().px(14).pb(4).text_size(11).text_color(t.dim)
-      .child("This is the only one. A new worktree checks out another branch in a second folder, so you can work on both at once.")))
+    .child(div().px(8).pt(8).pb(4).child(div().id("branch-filter").h(30).px(10).flex().items_center().rounded(8).border_1()
+      .border_color(finding ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .child(Input.new(input).h_full().text_size(12).text_color(t.foreground))))
+    .when(Boolean(blocked), (e) => e.child(h_flex().mx(8).mb(4).px(8).py(6).gap(6).items_center().rounded(7).bg(t.raised)
+      .child(div().flex_1().min_w(0).text_size(11).child(`Uncommitted changes are in the way of ${blocked.name}.`))
+      .child(pill("branch-stash", "Stash and switch", (cx) => on.stash(cx), t, true))
+      .child(pill("branch-stash-cancel", "Cancel", (cx) => on.cancel(cx), t))))
+    .child(scrolling(div().h(Math.min(Math.max(rows.length, 1), 6) * BRANCH_ROW + 12).flex_none(), "branch-list", rows, menu.empty, t))
     .child(div().id("new-worktree").h(30).mx(6).mb(6).px(8).flex().items_center().rounded(7).cursor_pointer().text_size(12).text_color(t.accent)
-      .hover((s) => s.bg(t.hover)).on_click((_e, cx) => on.create(cx)).child("+ New worktree"));
+      .tooltip("A new branch in a second folder, opened as its own space").hover((s) => s.bg(t.hover)).on_click((_e, cx) => on.newWorktree(cx))
+      .child("+ New worktree"));
 }
 
 /** Why the last read failed, and since when the panel shows older information. */

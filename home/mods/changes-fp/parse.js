@@ -104,6 +104,58 @@ export function parseLog(out) {
 /** The first branch or tag a commit carries, as a short label. */
 export const refLabel = (refs) => (refs ?? "").split(", ").filter(Boolean).map((r) => r.replace(/^HEAD -> /, "").replace(/^tag: /, "◆ "))[0];
 
+/** The `git for-each-ref` format parseBranches reads: fields split by unit separators, one ref a line. */
+export const BRANCH_FORMAT = "--format=%(refname)%1f%(upstream:short)%1f%(upstream:track,nobracket)%1f%(committerdate:unix)%1f%(symref)";
+
+/** `git for-each-ref` in BRANCH_FORMAT over refs/heads and refs/remotes: local and remote branches, newest first. */
+export function parseBranches(out) {
+  const list = [];
+  for (const line of out.split("\n")) {
+    const [ref, upstream, track = "", at, symref] = line.split("\x1f");
+    if (!ref || symref) continue;   // origin/HEAD points at another branch
+    const local = ref.startsWith("refs/heads/"), remote = ref.startsWith("refs/remotes/");
+    if (!local && !remote) continue;
+    const name = ref.slice(local ? 11 : 13);
+    if (remote && !name.includes("/")) continue;
+    list.push({
+      name, remote, upstream: upstream || null, at: Number(at) || 0,
+      ahead: Number(/ahead (\d+)/.exec(track)?.[1] ?? 0), behind: Number(/behind (\d+)/.exec(track)?.[1] ?? 0), gone: track === "gone",
+    });
+  }
+  return list.sort((a, b) => Number(a.remote) - Number(b.remote) || b.at - a.at);
+}
+
+const MAX_BRANCHES = 200;
+
+/**
+ * The branch list's rows. Each branch says where it is checked out: "here" (this folder), "folder" (another
+ * worktree, opened as its space), "local" (nowhere: switch this folder to it) or "remote" (only on a remote:
+ * switching makes a local branch that tracks it). A remote branch a local one already tracks is left out, and a
+ * worktree on no branch comes last. `create` is the filter when it names no local branch, to offer making it.
+ */
+export function branchRows(branches, trees, { root, caseless, filter = "" }) {
+  const here = (w) => samePath(slash(w.path), slash(root), caseless);
+  const byBranch = new Map(trees.filter((w) => w.branch).map((w) => [w.branch, w]));
+  const tracked = new Set(branches.filter((b) => !b.remote).flatMap((b) => [b.upstream, `${b.upstream?.split("/")[0]}/${b.name}`]));
+  const rows = [];
+  for (const b of branches) {
+    if (b.remote && tracked.has(b.name)) continue;
+    const w = b.remote ? null : byBranch.get(b.name);
+    const kind = w ? (here(w) ? "here" : "folder") : b.remote ? "remote" : "local";
+    rows.push({ ...b, kind, path: w?.path ?? null, main: Boolean(w?.main), locked: w?.locked ?? null, dirty: w?.dirty ?? 0 });
+  }
+  for (const w of trees.filter((w) => !w.branch)) {
+    rows.push({ name: `detached ${w.head.slice(0, 7)}`, detached: true, remote: false, kind: here(w) ? "here" : "folder", path: w.path,
+      main: w.main, locked: w.locked, dirty: w.dirty ?? 0, ahead: 0, behind: 0, at: 0 });
+  }
+  const rank = { here: 0, folder: 1, local: 1, remote: 2 };
+  rows.sort((a, b) => rank[a.kind] - rank[b.kind] || Number(Boolean(a.detached)) - Number(Boolean(b.detached)) || b.at - a.at);
+  const wanted = filter.trim(), needle = wanted.toLowerCase();
+  const shown = needle ? rows.filter((r) => r.name.toLowerCase().includes(needle)) : rows;
+  const create = wanted && !/\s/.test(wanted) && !branches.some((b) => !b.remote && b.name === wanted) ? wanted : null;
+  return { rows: shown.slice(0, MAX_BRANCHES), more: shown.length > MAX_BRANCHES, create };
+}
+
 /** Entries in `git status --porcelain=v1 -z`. */
 export const statusCount = (out) => out.split("\0").filter(Boolean).length;
 
