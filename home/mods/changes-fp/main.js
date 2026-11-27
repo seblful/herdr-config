@@ -411,9 +411,10 @@ export default class Changes extends View {
         newWorktree: (cx) => { this.menu = false; this.worktreeDialog("new", this.repo.root); cx.notify(); },
       })))
       .child(ui.tabBar(this.mode, body.files, t, (mode, cx) => this.setMode(mode, cx)))
-      .child(ui.listBox(history ? "changes-clist" : "changes-list", body.rows, body.rows.length, body.empty, t))
+      // History's commit list has no diff under it until a commit is opened: the list takes the room.
+      .child(ui.listBox(history ? "changes-clist" : "changes-list", body.rows, body.rows.length, body.empty, t, history && !this.history.sel))
       .when(!history && this.repo.limited, (e) => e.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
-      .child(ui.diffPane(history ? "changes-cdiff" : "changes-diff", body.view, body.hint, font, t))
+      .when(!history || Boolean(this.history.sel), (e) => e.child(ui.diffPane(history ? "changes-cdiff" : "changes-diff", body.view, body.hint, font, t)))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
       .when(Boolean(this.notice), (e) => e.child(div().id("notice").px(10).pb(8).text_size(11).text_color(t.muted).cursor_pointer().tooltip("Click to dismiss")
         .on_click((_e, cx) => { this.notice = null; cx.notify(); }).child(this.notice)))
@@ -451,7 +452,7 @@ export default class Changes extends View {
       rows: ui.commitRows(h.commits ?? [], { unpushed: h.unpushed, more: h.more, loading: h.loading, mono }, t, on),
       empty: h.commits?.length ? null : h.error || (this.repo.root ? "Loading commits…" : this.repo.error || "No folder"),
       view: EMPTY_DIFF,
-      hint: h.commits?.length ? "Select a commit to see its changes" : null,
+      hint: null,
     };
   }
 }

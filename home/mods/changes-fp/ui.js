@@ -137,9 +137,9 @@ export function fileRow(f, selected, onPick, t, id) {
     .children(delta(f.add, f.del, t));
 }
 
-/** A list of rows that grows with them, up to the space the diff leaves it. */
-export const listBox = (id, rows, count, empty, t) =>
-  scrolling(div().flex_1().min_h(44).max_h(count * ROW + 12).border_b(1).border_color(t.border), id, rows, empty, t);
+/** A list of rows that grows with them, up to the space the diff leaves it; `fill` takes all of it, with no diff below. */
+export const listBox = (id, rows, count, empty, t, fill = false) =>
+  scrolling(div().flex_1().min_h(44).when(!fill, (e) => e.max_h(count * ROW + 12).border_b(1).border_color(t.border)), id, rows, empty, t);
 
 /** History: one row per commit, ↑ on those not pushed, and Load more at the end. */
 export function commitRows(commits, { unpushed, more, loading, mono }, t, on) {
